@@ -1,0 +1,4 @@
+.PHONY: lint
+lint:
+	go install golang.org/x/lint/golint@latest
+	$(GOPATH)/bin/golint -set_exit_status=1 -fix ./...
