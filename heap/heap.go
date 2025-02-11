@@ -3,11 +3,13 @@ package heap
 import (
 	"encoding/binary"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 
 	"github.com/phuslu/log"
@@ -26,50 +28,62 @@ const permissionBits = 0755 // directory requires executioin as well hence 7 bit
 const heapFileNamePrefix = "heapFile"
 const heapfileNameSepparate = "-"
 
-const heapFileMetaSize = 4096
-
 type heapfilemeta struct {
 	heapfileNumber int
-	pageCount      uint32
 	fd             int
+	// serializable fields
+	pageCount uint32
+	buffer    []byte
 }
 
-func (hpm *heapfilemeta) Serialize(buffer []byte) {
-	binary.BigEndian.PutUint32(buffer[4:8], hpm.pageCount)
-	calculateCRC(buffer[0:4], buffer[4:])
+func (hpm *heapfilemeta) Serialize() {
+	binary.BigEndian.PutUint32(hpm.buffer[4:8], hpm.pageCount)
+	calculateCRC(hpm.buffer[0:4], hpm.buffer[4:])
 }
 
-func (hpm *heapfilemeta) Deserialize(buffer []byte) error {
-	hpm.pageCount = binary.BigEndian.Uint32(buffer[0:4])
+func (hpm *heapfilemeta) Deserialize() error {
+	hpm.pageCount = binary.BigEndian.Uint32(hpm.buffer[4:8])
 	crcBuffer := make([]byte, 4)
-	calculateCRC(crcBuffer, buffer[4:])
-	if !compareCRC(crcBuffer, buffer[0:4]) {
+	calculateCRC(crcBuffer, hpm.buffer[4:])
+	if !compareCRC(crcBuffer, hpm.buffer[0:4]) {
 		return fmt.Errorf("CRC mismatch")
 	}
 	return nil
 }
 
+func (hpm *heapfilemeta) SizeBytes(pageFileSize uint32) uint32 {
+	return pageFileSize + hpm.pageCount*pageFileSize
+}
+
 func totalPagesInHeapFile(heapfileSize uint32, pageSize uint32) uint32 {
-	return (heapfileSize - heapFileMetaSize) / pageSize
+	return (heapfileSize - pageSize) / pageSize
 }
 
 type fileSystemHeap struct {
 	logger                log.Logger
 	option                FileOptions
-	fileIdentifiers       []heapfilemeta
+	fileIdentifiers       []*heapfilemeta
 	totalAddressablePages uint64
 
 	totalPagesInHeapFile uint32
+
+	heapFileLock *sync.RWMutex
 }
 
 // Truncate heap file to last page number
 func (fsh *fileSystemHeap) Truncate(lastPageNumber uint64) error {
 
+	// no better way for this yet
+	// TODO :
+	// ensure lock at heap file level not at a global level maybe
+	fsh.heapFileLock.Lock()
+	defer fsh.heapFileLock.Unlock()
+
 	if fsh.totalAddressablePages < lastPageNumber {
 		return nil
 	}
 
-	newLastPageNumber := fsh.totalAddressablePages - lastPageNumber
+	newLastPageNumber := lastPageNumber
 	filesDeleted := 0
 
 	/*
@@ -84,7 +98,7 @@ func (fsh *fileSystemHeap) Truncate(lastPageNumber uint64) error {
 
 		pageSize := fsh.option.PageSizeByte
 
-		currentHeapFileStartPageNumber := uint64(totalPagesInHeapFile(fsh.option.HeapFileSizeByte, fsh.option.PageSizeByte) * uint32(i))
+		currentHeapFileStartPageNumber := uint64(fsh.totalPagesInHeapFile * uint32(i))
 
 		if newLastPageNumber <= currentHeapFileStartPageNumber {
 			// Delete everything in current file
@@ -93,18 +107,29 @@ func (fsh *fileSystemHeap) Truncate(lastPageNumber uint64) error {
 				fsh.logger.Error().Err(err).Msg(fmt.Sprintf("Failed to delete heap file %d", i))
 				return err
 			}
+			fsh.totalAddressablePages -= uint64(fsh.fileIdentifiers[i].pageCount)
 			filesDeleted++
 		} else {
 			// Truncate the file
-			newSize := newLastPageNumber - currentHeapFileStartPageNumber
-			err := syscall.Ftruncate(fsh.fileIdentifiers[i].fd, int64(newSize*uint64(pageSize)))
+			newSize := newLastPageNumber - currentHeapFileStartPageNumber // making sure metadata is intact
+			err := syscall.Ftruncate(fsh.fileIdentifiers[i].fd, int64(newSize*uint64(pageSize)+uint64(getHeapFileMetaSize(fsh.option))))
 			if err != nil {
 				fsh.logger.Error().Err(err).Msg(fmt.Sprintf("Failed to truncate heap file %d", i))
 				return err
 			}
+
+			fsh.fileIdentifiers[i].pageCount = uint32(newSize)
+			fsh.fileIdentifiers[i].Serialize()
+			fsh.totalAddressablePages -= uint64(fsh.fileIdentifiers[i].pageCount)
+
+			_, err = syscall.Pwrite(fsh.fileIdentifiers[i].fd, fsh.fileIdentifiers[i].buffer, 0)
+			if err != nil {
+				fsh.logger.Error().Err(err).Msg(fmt.Sprintf("Failed to write heap file %d", i))
+				return err
+			}
+
 			break
 		}
-
 	}
 
 	fsh.fileIdentifiers = fsh.fileIdentifiers[:len(fsh.fileIdentifiers)-filesDeleted]
@@ -116,98 +141,85 @@ func (fsh *fileSystemHeap) Truncate(lastPageNumber uint64) error {
 // Add new heap file or extend existing one based on page count
 func (fsh *fileSystemHeap) AllocatePage(pageCount int) error {
 
-	lastHeapfilePtr := len(fsh.fileIdentifiers) - 1
+	fsh.heapFileLock.Lock()
+	defer fsh.heapFileLock.Unlock()
 
-	stat, err := os.Stat(filepath.Join(fsh.option.FileDirectory, heapFileName(lastHeapfilePtr)))
-	if err != nil {
-		fsh.logger.Error().Err(err).Msg(fmt.Sprintf("Failed to get heap file stat:  %d", lastHeapfilePtr))
-		return err
-	}
+	pagesRemainingToAllocate := uint64(pageCount)
 
-	totalNewHeapFiles := uint32(pageCount) / fsh.totalPagesInHeapFile
-	// remainingSize := stat.Size() % int64(fsh.option.HeapFileSizeByte)
+	lastHeapFile := fsh.fileIdentifiers[len(fsh.fileIdentifiers)-1]
+	for pagesRemainingToAllocate != 0 {
 
-	if totalNewHeapFiles > 0 {
+		if lastHeapFile.SizeBytes(fsh.option.PageSizeByte) == fsh.option.HeapFileSizeByte {
+			// create a new heap file
+			// extend size upto max heap file size of pageRemainingToAllocate whichever is lesser
+			// update the new page count on disk
+			// update the last heapfile
+			// update the total addressable pages
+			// reduce the pageRemainingToAllocate by that count
 
-		for i := 0; i < int(totalNewHeapFiles); i++ {
-			fd, err := syscall.Open(filepath.Join(fsh.option.FileDirectory, heapFileName(lastHeapfilePtr+1)), syscall.O_RDWR|syscall.O_DSYNC|syscall.O_CREAT, permissionBits)
+			extraPages := fsh.totalPagesInHeapFile
+
+			extraPages = uint32(math.Min(float64(extraPages), float64(pagesRemainingToAllocate)))
+
+			hpf, err := createNewEmptyHeapFile(len(fsh.fileIdentifiers), fsh.option, fsh.logger)
+
 			if err != nil {
-				fsh.logger.Error().Err(err).Msg(fmt.Sprintf("Failed to open heap file %d", i))
-				return err
-			}
-			err = syscall.Fallocate(fd, 0, 0, int64(fsh.option.HeapFileSizeByte))
-			if err != nil {
-				fsh.logger.Error().Err(err).Msg(fmt.Sprintf("Failed to allocate page in heap file %d", i))
-				return err
-			}
-
-			buffer := make([]byte, fsh.option.HeapFileSizeByte)
-			putEmptyHeapPage(buffer[heapFileMetaSize:], fsh.option.PageSizeByte, int(fsh.totalPagesInHeapFile))
-			_, err = syscall.Pwrite(fd, buffer, heapFileMetaSize)
-			if err != nil {
-				fsh.logger.Error().Err(err).Msg(fmt.Sprintf("Failed to write to heap file %d", i))
+				fsh.logger.Error().Err(err).Msg(fmt.Sprintf("Failed to create new heap file %d", len(fsh.fileIdentifiers)))
 				return err
 			}
 
-			// ensuring heapfile meta is consistent
+			err = fsh.allocatePagesInHeapFile(hpf, int64(hpf.SizeBytes(fsh.option.PageSizeByte)), int64(extraPages))
 
-			hpm := heapfilemeta{
-				pageCount: fsh.option.HeapFileSizeByte,
-				fd:        fd,
-			}
-			hpm.Serialize(buffer[0:heapFileMetaSize])
-			_, err = syscall.Pwrite(fd, buffer[0:heapFileMetaSize], heapFileMetaSize)
 			if err != nil {
-				fsh.logger.Error().Err(err).Msg(fmt.Sprintf("Failed to write to heap file %d", i))
+				fsh.logger.Error().Err(err).Msg(fmt.Sprintf("Failed to allocate pages in heap file %d", len(fsh.fileIdentifiers)))
 				return err
 			}
 
-			fsh.fileIdentifiers = append(fsh.fileIdentifiers, hpm)
+			fsh.fileIdentifiers = append(fsh.fileIdentifiers, hpf)
+			lastHeapFile = hpf
+			pagesRemainingToAllocate -= uint64(extraPages)
+			fsh.totalAddressablePages += uint64(extraPages)
+		} else {
+			// extend current heap file to max heap file size in the file
+			// reduce page Remaining to allocate by that count
+			// increase the pageCount of this last page and the total adddressable pages
+
+			heapFileSize := int64(lastHeapFile.SizeBytes(fsh.option.PageSizeByte))
+
+			extraPages := (int64(fsh.option.HeapFileSizeByte) - heapFileSize) / int64(fsh.option.PageSizeByte)
+
+			extraPages = int64(math.Min(float64(extraPages), float64(pagesRemainingToAllocate)))
+
+			err := fsh.allocatePagesInHeapFile(lastHeapFile, heapFileSize, extraPages)
+			if err != nil {
+				return err
+			}
+
+			fsh.totalAddressablePages += uint64(extraPages)
+			pagesRemainingToAllocate -= uint64(extraPages)
 		}
 
 	}
 
-	// if sizeToExtend := math.Min(float64(fsh.option.HeapFileSizeByte-uint32(stat.Size())), float64(remainingSize)); sizeToExtend > 0 {
+	return nil
+}
 
-	// 	err := syscall.Fallocate(fsh.fileIdentifiers[lastHeapfilePtr].fd, 0, stat.Size(), int64(sizeToExtend))
-	// 	if err != nil {
-	// 		fsh.logger.Error().Err(err).Msg(fmt.Sprintf("Failed to allocate page in heap file %d", lastHeapfilePtr))
-	// 		return err
-	// 	}
+func (fsh *fileSystemHeap) allocatePagesInHeapFile(hpf *heapfilemeta, heapFileSize int64, extraPages int64) error {
+	err := syscall.Fallocate(hpf.fd, 0, heapFileSize, extraPages*int64(fsh.option.PageSizeByte))
+	if err != nil {
+		fsh.logger.Error().Err(err).Msg(fmt.Sprintf("Failed to extend heap file %d", hpf.heapfileNumber))
+		return err
+	}
+	hpf.pageCount += uint32(extraPages)
+	hpf.Serialize()
+	_, err = syscall.Pwrite(hpf.fd, hpf.buffer, 0)
+	if err != nil {
+		hpf.pageCount -= uint32(extraPages)
+		fsh.logger.Error().Err(err).Msg(fmt.Sprintf("Failed to write heap file %d", hpf.heapfileNumber))
+		return err
+	}
 
-	// 	buffer := make([]byte, int(sizeToExtend))
-	// 	putEmptyHeapPage(buffer, uint64(fsh.option.PageSizeByte), int(sizeToExtend)/int(fsh.option.PageSizeByte))
-	// 	_, err = syscall.Pwrite(fsh.fileIdentifiers[lastHeapfilePtr].fd, buffer, int64(stat.Size()))
-	// 	if err != nil {
-	// 		fsh.logger.Error().Err(err).Msg(fmt.Sprintf("Failed to write to heap file %d", lastHeapfilePtr))
-	// 		return err
-	// 	}
-
-	// 	if extraRemaining := remainingSize - int64(sizeToExtend); extraRemaining > 0 {
-	// 		fd, err := syscall.Open(filepath.Join(fsh.option.FileDirectory, heapFileName(lastHeapfilePtr+int(totalNewHeapFiles)+1)), syscall.O_RDWR|syscall.O_DSYNC|syscall.O_CREAT, permissionBits)
-	// 		if err != nil {
-	// 			fsh.logger.Error().Err(err).Msg(fmt.Sprintf("Failed to open heap file %d", lastHeapfilePtr+int(totalNewHeapFiles)+1))
-	// 			return err
-	// 		}
-	// 		err = syscall.Fallocate(fd, 0, 0, extraRemaining)
-	// 		if err != nil {
-	// 			fsh.logger.Error().Err(err).Msg(fmt.Sprintf("Failed to allocate page in heap file %d", lastHeapfilePtr+int(totalNewHeapFiles)+1))
-	// 			return err
-	// 		}
-
-	// 		buffer := make([]byte, fsh.option.PageSizeByte*uint32(pageCount))
-	// 		putEmptyHeapPage(buffer, uint64(fsh.option.PageSizeByte), pageCount)
-	// 		syscall.Pwrite(fsh.fileIdentifiers[lastHeapfilePtr].fd, buffer,0)
-
-	// 		fsh.fileIdentifiers = append(fsh.fileIdentifiers, heapfilemeta{
-	// 			pageCount:
-	// 		})
-	// 	}
-	// }
-
-	fsh.totalAddressablePages += uint64(pageCount)
-
-	return err
+	return nil
 }
 
 func (fsh *fileSystemHeap) Read(pageNumber uint64, onRead func(*PageFileBlock, error)) {
@@ -239,12 +251,35 @@ func (fsh *fileSystemHeap) MaxAddressablePage() uint64 {
 	return fsh.totalAddressablePages
 }
 
+func getHeapFileMetaSize(option FileOptions) uint32 {
+	return uint32(option.PageSizeByte)
+}
+
 /*
 Creates heapfile in sequence , starts with a heap file of size page size
 if list of heap file is empty. If not loads the heapfile file pointer
 and stores them.
 */
 func NewHeap(logger log.Logger, option FileOptions) (HeapFile, error) {
+
+	// create heap meta file to lock the heap file status like
+	// pageFileSize
+	// heapFileMaxSize
+	// - these values can never change
+	// - any artifact trying to read this in any other manner will tamper the heap file
+
+	heapFileMetaSize := getHeapFileMetaSize(option)
+
+	_, err := os.Stat(option.FileDirectory)
+
+	if err != nil {
+		logger.Error().Err(err).Msg("Creating heap file directory")
+		err = os.Mkdir(option.FileDirectory, os.ModePerm)
+		if err != nil {
+			logger.Error().Err(err).Msg("Failed to create heap file directory")
+			return nil, err
+		}
+	}
 
 	fileEntries, err := os.ReadDir(option.FileDirectory)
 
@@ -253,14 +288,16 @@ func NewHeap(logger log.Logger, option FileOptions) (HeapFile, error) {
 		return nil, err
 	}
 
-	fileIdentifiers := make([]heapfilemeta, 0, len(fileEntries))
-	fileIdentifiersMap := make(map[string]heapfilemeta)
+	fileIdentifiers := make([]*heapfilemeta, 0, len(fileEntries))
+	fileIdentifiersMap := make(map[string]*heapfilemeta)
 	totalAddressablePages := uint64(0)
 	for _, fileEntry := range fileEntries {
 		if fileEntry.IsDir() {
 			continue
 		}
 		if strings.Contains(fileEntry.Name(), "heap") {
+
+			// get all of the heap files
 			fileLocation := filepath.Join(option.FileDirectory, fileEntry.Name())
 			logger.Info().Str("file", fileLocation).Msg(fmt.Sprintf("Found heap file %s", fileEntry.Name()))
 
@@ -278,37 +315,75 @@ func NewHeap(logger log.Logger, option FileOptions) (HeapFile, error) {
 				return nil, err
 			}
 
-			hpf := heapfilemeta{
+			// stash the fd and heap file number
+			hpf := &heapfilemeta{
 				fd:             fd,
 				heapfileNumber: int(fileNumber),
 			}
+
 			fileIdentifiersMap[fileEntry.Name()] = hpf
 		}
 	}
 
-	// TODO :
-	// load each heapfile
-	// check meta CRC , if correct load page count and truncate files to ensure correct sizes
-	// if incorrect check size of file if it only has metadata delete the file
-	// if size is large and has other data as well do a checksum check for every page and update size data accordingly
-
 	for _, hpf := range fileIdentifiersMap {
 
-		buffer := make([]byte, heapFileMetaSize)
+		buffer := make([]byte, option.PageSizeByte)
 		_, err := syscall.Pread(hpf.fd, buffer, 0)
 		if err != nil {
 			logger.Error().Err(err).Msg("Failed to read heap file")
 			return nil, err
 		}
-		if hpf.Deserialize(buffer) != nil {
-			// heap file is potentially corrupted -> must fix or deleted
+		hpf.buffer = buffer
+		stat, err := os.Stat(filepath.Join(option.FileDirectory, heapFileName(hpf.heapfileNumber)))
+		// corrects the file meta based on the file size
+		// further correction logic can involve reading all the pages and checking how many of them are legit
+		// pages and then truncating them off
+		// TODO:
+		// potential issue of partial page writes is not handled. So if the heap has bunch of corrupted pages
+		// its upto page manager to handle it. or the system can be set in RAID 1
+		if hpf.Deserialize() != nil {
+
+			if err != nil {
+				logger.Error().Err(err).Msg("Failed to get stat of heap file")
+				return nil, err
+			}
+
+			// correction phase
+			// confirm if size is a multiple of page size + heapMetaSize
+			if (stat.Size()-int64(heapFileMetaSize))%int64(option.PageSizeByte) == 0 {
+				// correct the page file
+				totalPages := (stat.Size() - int64(heapFileMetaSize)) / int64(option.PageSizeByte)
+				hpf.pageCount = uint32(totalPages)
+			}
+
+			hpf.Serialize()
+			_, err = syscall.Pwrite(hpf.fd, hpf.buffer, 0)
+			if err != nil {
+				logger.Error().Err(err).Msg("Failed to write heap file")
+				return nil, err
+			}
+			hpf.Deserialize()
 		}
 
-		err = syscall.Ftruncate(hpf.fd, int64(hpf.pageCount*option.PageSizeByte))
-		if err != nil {
-			logger.Error().Err(err).Msg("Failed to truncate heap file")
-			return nil, err
+		if hpf.pageCount > totalPagesInHeapFile(uint32(stat.Size()), option.PageSizeByte) {
+			logger.Error().Msg("Heap file size is smaller than page count. in correct meta information")
+			hpf.pageCount = totalPagesInHeapFile(uint32(stat.Size()), option.PageSizeByte)
+			hpf.Serialize()
+			_, err = syscall.Pwrite(hpf.fd, hpf.buffer, 0)
+			if err != nil {
+				logger.Error().Err(err).Msg("Failed to write heap file")
+				return nil, err
+			}
+
+		} else {
+			err = syscall.Ftruncate(hpf.fd, int64(hpf.pageCount)*int64(option.PageSizeByte)+int64(heapFileMetaSize))
+			if err != nil {
+				logger.Error().Err(err).Msg("Failed to truncate heap file")
+				return nil, err
+			}
 		}
+
+		totalAddressablePages += uint64(hpf.pageCount)
 		fileIdentifiers = append(fileIdentifiers, hpf)
 	}
 
@@ -317,28 +392,10 @@ func NewHeap(logger log.Logger, option FileOptions) (HeapFile, error) {
 	})
 
 	if len(fileIdentifiers) == 0 {
-		fd, err := syscall.Open(filepath.Join(option.FileDirectory, heapFileName(0)), syscall.O_RDWR|syscall.O_DSYNC|syscall.O_CREAT, permissionBits)
+		hpm, err := createNewEmptyHeapFile(0, option, logger)
 		if err != nil {
-			logger.Error().Err(err).Msg(fmt.Sprintf("Failed to open heap file %d", 0))
 			return nil, err
 		}
-
-		err = syscall.Fallocate(fd, 0, 0, int64(heapFileMetaSize))
-		if err != nil {
-			logger.Error().Err(err).Msg(fmt.Sprintf("Failed to allocate page in heap file %d", i))
-			return nil, err
-		}
-
-		hpm := heapfilemeta{
-			pageCount: 0,
-			fd:        fd,
-		}
-
-		buffer := make([]byte, heapFileMetaSize)
-
-		hpm.Serialize(buffer)
-
-		_, err = syscall.Pwrite(fd, buffer, 0)
 
 		// TODO : correct file size based on meta
 		fileIdentifiers = append(fileIdentifiers, hpm)
@@ -349,5 +406,41 @@ func NewHeap(logger log.Logger, option FileOptions) (HeapFile, error) {
 		fileIdentifiers:       fileIdentifiers,
 		totalAddressablePages: totalAddressablePages,
 		totalPagesInHeapFile:  totalPagesInHeapFile(option.HeapFileSizeByte, option.PageSizeByte),
+		heapFileLock:          &sync.RWMutex{},
+		option:                option,
 	}, nil
+}
+
+func createNewEmptyHeapFile(heapfileIndex int, option FileOptions, logger log.Logger) (*heapfilemeta, error) {
+
+	heapFileMetaSize := getHeapFileMetaSize(option)
+
+	fd, err := syscall.Open(filepath.Join(option.FileDirectory, heapFileName(heapfileIndex)), syscall.O_RDWR|syscall.O_DSYNC|syscall.O_CREAT, permissionBits)
+	if err != nil {
+		logger.Error().Err(err).Msg(fmt.Sprintf("Failed to open heap file %d", heapfileIndex))
+		return nil, err
+	}
+
+	err = syscall.Fallocate(fd, 0, 0, int64(heapFileMetaSize))
+	if err != nil {
+		logger.Error().Err(err).Msg(fmt.Sprintf("Failed to allocate page in heap file %d", heapfileIndex))
+		return nil, err
+	}
+
+	hpm := &heapfilemeta{
+		pageCount:      0,
+		fd:             fd,
+		heapfileNumber: heapfileIndex,
+	}
+
+	hpm.buffer = make([]byte, heapFileMetaSize)
+	hpm.Serialize()
+
+	_, err = syscall.Pwrite(fd, hpm.buffer, 0)
+
+	if err != nil {
+		logger.Error().Err(err).Msg(fmt.Sprintf("Failed to write heap file %d", heapfileIndex))
+		return nil, err
+	}
+	return hpm, nil
 }
