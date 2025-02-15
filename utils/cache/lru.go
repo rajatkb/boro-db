@@ -1,5 +1,7 @@
 package cache
 
+import "sync"
+
 // dumb LRU implementation
 func NewLRUCache[K comparable, V any](size int) Cache[K, V] {
 	return &LRUCache[K, V]{
@@ -14,6 +16,7 @@ type LRUCache[K comparable, V any] struct {
 	size     int
 	listHead *Node[K, V]
 	length   int
+	lock     sync.RWMutex
 }
 
 type Node[K comparable, V any] struct {
@@ -32,12 +35,10 @@ func (c *LRUCache[K, V]) Size() int {
 // as long as the lock is held nothing can read
 // or write on the cache. Stalling most operations
 func (c *LRUCache[K, V]) Range(onEach func(K, V) bool) {
-
+	c.lock.RLock()
+	defer c.lock.RUnlock()
 	head := c.listHead
-	// while we do range we can also compact the cache
-	c.Compact(func(k K, v V) bool {
-		return onEach(k, v)
-	})
+
 	// post compaction just iterate as usual
 	for {
 		if !onEach(head.key, head.value) {
@@ -51,28 +52,25 @@ func (c *LRUCache[K, V]) Range(onEach func(K, V) bool) {
 	}
 }
 
-// Compact holds a global lock on the page cache
-// as long as the lock is held nothing can read
-// or write on the cache. Stalling most operations
 func (c *LRUCache[K, V]) Compact(onEvict func(K, V) bool) {
-
+	c.lock.Lock()
+	defer c.lock.Unlock()
 	if c.length <= c.size {
 		return
 	}
 
 	for c.length > c.size {
 		key := c.listHead.key
-		if !c.Evict(key, func(v V) bool {
+		c.Evict(key, func(v V) bool {
 			return onEvict(key, v)
-		}) {
-			return
-		}
+		})
 	}
 }
 
 // Evict holds a global lock and deletes a page
 func (c *LRUCache[K, V]) Evict(key K, preEvict func(V) bool) bool {
-
+	c.lock.Lock()
+	defer c.lock.Unlock()
 	value := c.cache[key]
 
 	if !preEvict(value.value) {
@@ -98,7 +96,8 @@ func (c *LRUCache[K, V]) Evict(key K, preEvict func(V) bool) bool {
 
 // Put holds a global lock and adds a value to the cache
 func (c *LRUCache[K, V]) Put(key K, value V) {
-
+	c.lock.Lock()
+	defer c.lock.Unlock()
 	node := &Node[K, V]{
 		key:   key,
 		value: value,
@@ -123,7 +122,8 @@ func (c *LRUCache[K, V]) Put(key K, value V) {
 
 // Get holds a global lock and returns a value from the cache
 func (c *LRUCache[K, V]) Get(key K) (V, bool) {
-
+	c.lock.RLock()
+	defer c.lock.RUnlock()
 	value, ok := c.cache[key]
 
 	if !ok {

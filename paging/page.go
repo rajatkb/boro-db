@@ -14,9 +14,15 @@ PagefileBlock inside heap file
 ┌──────────────────────────────────────────────────────────────┐
 | checkSum (4 bytes)                                           |
 |──────────────────────────────────────────────────────────────|
+| LSN (8 bytes)                                                |
 | ......                                                       |
 |-------------------------- System Page Size (4096) -----------|
-|                                                              |
+| checkSum (4 bytes)                                           |
+|──────────────────────────────────────────────────────────────|
+| LSN (8 bytes)                                                |
+| ......                                                       |
+|-------------------------- System Page Size (4096) -----------|
+| ...............reapeat x PageCountInBlock....................|
 └──────────────────────────────────────────────────────────────┘
 
 A single pageFileBlock is composed of multiple pages
@@ -42,11 +48,12 @@ type PageFileBlock struct {
 
 	// buffer contains entire page data use getter and setters
 	// to change the data
-	pageNumber uint64
-	dirty      bool
-	buffer     []byte
-	crcMatch   bool
-	mutex      sync.Mutex
+	pageCountInBlock uint32
+	pageNumber       uint64
+	dirty            bool
+	buffer           []byte
+	crcMatch         bool
+	mutex            sync.RWMutex
 }
 
 func PageFileBlockBufferMaxSize(pageSizeByte uint32) uint32 {
@@ -83,7 +90,15 @@ func (pfb *PageFileBlock) CheckCRCMatch() bool {
 	return crcMatch
 }
 
+// TODO: MUST BE DONE
+// add a new method to represent multiple page files creating a single block
+// update the write method accrodingly
+// we will require now to have LSN (last synced number) and also CSN (current sync number)
+// this is to indicate the status of the page file block updated status
 func (pfb *PageFileBlock) SetPageBuffer(offset int, buffer []byte, option *heap.FileOptions) error {
+
+	pfb.mutex.Lock()
+	defer pfb.mutex.Unlock()
 
 	if offset > len(pfb.buffer)-pageBufferBlockByteOffset || len(buffer) > len(pfb.buffer)-pageBufferBlockByteOffset {
 		return ErrOutOfBounds
@@ -96,10 +111,11 @@ func (pfb *PageFileBlock) SetPageBuffer(offset int, buffer []byte, option *heap.
 	return nil
 }
 
-func (pfb *PageFileBlock) Serialize() []byte {
+func (pfb *PageFileBlock) serialize() []byte {
 
 	if pfb.dirty {
 		checksums.CalculateCRC(pfb.GetCheckSumBuffer(), pfb.GetPostCRCBuffer())
 	}
+
 	return pfb.buffer
 }
