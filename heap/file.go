@@ -12,7 +12,7 @@ type FileOptions struct {
 type HeapFile interface {
 	Truncate(lastPageNumber uint64) error
 	AllocatePage(pageCount int) error
-	Read(pageNumber uint64, onRead func(*PageFileBlock, error))
-	Write(pageNumber uint64, pfb *PageFileBlock, onWrite func(error))
+	Read(pageNumber uint64, buffer []byte, onRead func(error))
+	Write(pageNumber uint64, buffer []byte, onWrite func(error))
 	MaxAddressablePage() uint64
 }

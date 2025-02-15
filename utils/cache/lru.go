@@ -1,24 +1,19 @@
 package cache
 
-import "sync"
-
 // dumb LRU implementation
-func NewLRUCache[K comparable, V any](size int, disableLocks bool) *LRUCache[K, V] {
+func NewLRUCache[K comparable, V any](size int) Cache[K, V] {
 	return &LRUCache[K, V]{
-		cache:        make(map[K]*Node[K, V], size),
-		size:         size,
-		listHead:     nil,
-		disableLocks: disableLocks,
+		cache:    make(map[K]*Node[K, V], size),
+		size:     size,
+		listHead: nil,
 	}
 }
 
 type LRUCache[K comparable, V any] struct {
-	cache        map[K]*Node[K, V]
-	size         int
-	listHead     *Node[K, V]
-	length       int
-	lock         sync.Mutex
-	disableLocks bool
+	cache    map[K]*Node[K, V]
+	size     int
+	listHead *Node[K, V]
+	length   int
 }
 
 type Node[K comparable, V any] struct {
@@ -28,14 +23,15 @@ type Node[K comparable, V any] struct {
 	next  *Node[K, V]
 }
 
+func (c *LRUCache[K, V]) Size() int {
+
+	return c.length
+}
+
 // Range holds a global lock on the page cache
 // as long as the lock is held nothing can read
 // or write on the cache. Stalling most operations
 func (c *LRUCache[K, V]) Range(onEach func(K, V) bool) {
-	if !c.disableLocks {
-		c.lock.Lock()
-		defer c.lock.Unlock()
-	}
 
 	head := c.listHead
 	// while we do range we can also compact the cache
@@ -59,10 +55,6 @@ func (c *LRUCache[K, V]) Range(onEach func(K, V) bool) {
 // as long as the lock is held nothing can read
 // or write on the cache. Stalling most operations
 func (c *LRUCache[K, V]) Compact(onEvict func(K, V) bool) {
-	if !c.disableLocks {
-		c.lock.Lock()
-		defer c.lock.Unlock()
-	}
 
 	if c.length <= c.size {
 		return
@@ -80,10 +72,7 @@ func (c *LRUCache[K, V]) Compact(onEvict func(K, V) bool) {
 
 // Evict holds a global lock and deletes a page
 func (c *LRUCache[K, V]) Evict(key K, preEvict func(V) bool) bool {
-	if !c.disableLocks {
-		c.lock.Lock()
-		defer c.lock.Unlock()
-	}
+
 	value := c.cache[key]
 
 	if !preEvict(value.value) {
@@ -109,10 +98,6 @@ func (c *LRUCache[K, V]) Evict(key K, preEvict func(V) bool) bool {
 
 // Put holds a global lock and adds a value to the cache
 func (c *LRUCache[K, V]) Put(key K, value V) {
-	if !c.disableLocks {
-		c.lock.Lock()
-		defer c.lock.Unlock()
-	}
 
 	node := &Node[K, V]{
 		key:   key,
@@ -138,11 +123,6 @@ func (c *LRUCache[K, V]) Put(key K, value V) {
 
 // Get holds a global lock and returns a value from the cache
 func (c *LRUCache[K, V]) Get(key K) (V, bool) {
-
-	if !c.disableLocks {
-		c.lock.Lock()
-		defer c.lock.Unlock()
-	}
 
 	value, ok := c.cache[key]
 

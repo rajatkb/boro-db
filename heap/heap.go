@@ -1,6 +1,7 @@
 package heap
 
 import (
+	"boro-db/utils/checksums"
 	"encoding/binary"
 	"fmt"
 	"math"
@@ -38,14 +39,14 @@ type heapfilemeta struct {
 
 func (hpm *heapfilemeta) Serialize() {
 	binary.BigEndian.PutUint32(hpm.buffer[4:8], hpm.pageCount)
-	calculateCRC(hpm.buffer[0:4], hpm.buffer[4:])
+	checksums.CalculateCRC(hpm.buffer[0:4], hpm.buffer[4:])
 }
 
 func (hpm *heapfilemeta) Deserialize() error {
 	hpm.pageCount = binary.BigEndian.Uint32(hpm.buffer[4:8])
 	crcBuffer := make([]byte, 4)
-	calculateCRC(crcBuffer, hpm.buffer[4:])
-	if !compareCRC(crcBuffer, hpm.buffer[0:4]) {
+	checksums.CalculateCRC(crcBuffer, hpm.buffer[4:])
+	if !checksums.CompareCRC(crcBuffer, hpm.buffer[0:4]) {
 		return fmt.Errorf("CRC mismatch")
 	}
 	return nil
@@ -112,19 +113,26 @@ func (fsh *fileSystemHeap) Truncate(lastPageNumber uint64) error {
 		} else {
 			// Truncate the file
 			newSize := newLastPageNumber - currentHeapFileStartPageNumber // making sure metadata is intact
-			err := syscall.Ftruncate(fsh.fileIdentifiers[i].fd, int64(newSize*uint64(pageSize)+uint64(getHeapFileMetaSize(fsh.option))))
-			if err != nil {
-				fsh.logger.Error().Err(err).Msg(fmt.Sprintf("Failed to truncate heap file %d", i))
-				return err
-			}
 
 			fsh.fileIdentifiers[i].pageCount = uint32(newSize)
 			fsh.fileIdentifiers[i].Serialize()
 			fsh.totalAddressablePages -= uint64(fsh.fileIdentifiers[i].pageCount)
 
-			_, err = syscall.Pwrite(fsh.fileIdentifiers[i].fd, fsh.fileIdentifiers[i].buffer, 0)
+			_, err := syscall.Pwrite(fsh.fileIdentifiers[i].fd, fsh.fileIdentifiers[i].buffer, 0)
 			if err != nil {
 				fsh.logger.Error().Err(err).Msg(fmt.Sprintf("Failed to write heap file %d", i))
+				return err
+			}
+
+			err = syscall.Fsync(fsh.fileIdentifiers[i].fd)
+			if err != nil {
+				fsh.logger.Error().Err(err).Msg(fmt.Sprintf("Failed to fsync heap file %d", fsh.fileIdentifiers[i].heapfileNumber))
+				return err
+			}
+
+			err = syscall.Ftruncate(fsh.fileIdentifiers[i].fd, int64(newSize*uint64(pageSize)+uint64(getHeapFileMetaSize(fsh.option))))
+			if err != nil {
+				fsh.logger.Error().Err(err).Msg(fmt.Sprintf("Failed to truncate heap file %d", i))
 				return err
 			}
 
@@ -219,35 +227,44 @@ func (fsh *fileSystemHeap) allocatePagesInHeapFile(hpf *heapfilemeta, heapFileSi
 		return err
 	}
 
+	err = syscall.Fsync(hpf.fd)
+	if err != nil {
+		fsh.logger.Error().Err(err).Msg(fmt.Sprintf("Failed to fsync heap file %d", hpf.heapfileNumber))
+		return err
+	}
+
 	return nil
 }
 
-func (fsh *fileSystemHeap) Read(pageNumber uint64, onRead func(*PageFileBlock, error)) {
+func (fsh *fileSystemHeap) Read(pageNumber uint64, buffer []byte, onRead func(error)) {
 
 	heapFile := pageNumber / uint64(fsh.totalPagesInHeapFile)
 	heapFileOffset := pageNumber % uint64(fsh.totalPagesInHeapFile)
 
-	buffer := make([]byte, fsh.option.PageSizeByte)
+	_, err := syscall.Pread(fsh.fileIdentifiers[heapFile].fd, buffer, int64(getHeapFileMetaSize(fsh.option))+int64(heapFileOffset*uint64(fsh.option.PageSizeByte)))
 
-	_, err := syscall.Pread(fsh.fileIdentifiers[heapFile].fd, buffer, int64(heapFileOffset*uint64(fsh.option.PageSizeByte)))
-
-	onRead(readPageFileBlock(buffer, uint64(fsh.option.PageSizeByte)), err)
+	onRead(err)
 }
 
-func (fsh *fileSystemHeap) Write(pageNumber uint64, pfb *PageFileBlock, onWrite func(error)) {
+func (fsh *fileSystemHeap) Write(pageNumber uint64, buffer []byte, onWrite func(error)) {
 
 	heapFile := pageNumber / uint64(fsh.option.HeapFileSizeByte/fsh.option.PageSizeByte)
 	heapFileOffset := pageNumber % uint64(fsh.option.HeapFileSizeByte/fsh.option.PageSizeByte)
 
-	buffer := pfb.Serialize()
+	_, err := syscall.Pwrite(fsh.fileIdentifiers[heapFile].fd, buffer, int64(getHeapFileMetaSize(fsh.option))+int64(heapFileOffset*uint64(fsh.option.PageSizeByte)))
 
-	_, err := syscall.Pwrite(fsh.fileIdentifiers[heapFile].fd, buffer, int64(heapFileOffset*uint64(fsh.option.PageSizeByte)))
+	if err := syscall.Fsync(fsh.fileIdentifiers[heapFile].fd); err != nil {
+		fsh.logger.Error().Err(err).Msg(fmt.Sprintf("Failed to fsync heap file %d", heapFile))
+		onWrite(err)
+		return
+	}
 
 	onWrite(err)
 }
 
 func (fsh *fileSystemHeap) MaxAddressablePage() uint64 {
-
+	fsh.heapFileLock.Lock()
+	defer fsh.heapFileLock.Unlock()
 	return fsh.totalAddressablePages
 }
 
@@ -362,25 +379,21 @@ func NewHeap(logger log.Logger, option FileOptions) (HeapFile, error) {
 				logger.Error().Err(err).Msg("Failed to write heap file")
 				return nil, err
 			}
+			if err := syscall.Fsync(hpf.fd); err != nil {
+				logger.Error().Err(err).Msg(fmt.Sprintf("Failed to fsync heap file %d", hpf.heapfileNumber))
+				return nil, err
+			}
 			hpf.Deserialize()
 		}
 
-		if hpf.pageCount > totalPagesInHeapFile(uint32(stat.Size()), option.PageSizeByte) {
-			logger.Error().Msg("Heap file size is smaller than page count. in correct meta information")
-			hpf.pageCount = totalPagesInHeapFile(uint32(stat.Size()), option.PageSizeByte)
-			hpf.Serialize()
-			_, err = syscall.Pwrite(hpf.fd, hpf.buffer, 0)
-			if err != nil {
-				logger.Error().Err(err).Msg("Failed to write heap file")
-				return nil, err
-			}
-
-		} else {
-			err = syscall.Ftruncate(hpf.fd, int64(hpf.pageCount)*int64(option.PageSizeByte)+int64(heapFileMetaSize))
-			if err != nil {
-				logger.Error().Err(err).Msg("Failed to truncate heap file")
-				return nil, err
-			}
+		// pageCount can never be larger than the HeapFiles current pages
+		// Since in Truncate command we first commit the page size information
+		// and only then truncate the file. This ensures when recoveruing we end up with
+		// a consistent heap file.
+		err = syscall.Ftruncate(hpf.fd, int64(hpf.pageCount)*int64(option.PageSizeByte)+int64(heapFileMetaSize))
+		if err != nil {
+			logger.Error().Err(err).Msg("Failed to truncate heap file")
+			return nil, err
 		}
 
 		totalAddressablePages += uint64(hpf.pageCount)
@@ -442,5 +455,14 @@ func createNewEmptyHeapFile(heapfileIndex int, option FileOptions, logger log.Lo
 		logger.Error().Err(err).Msg(fmt.Sprintf("Failed to write heap file %d", heapfileIndex))
 		return nil, err
 	}
+	if err := syscall.Fsync(fd); err != nil {
+		logger.Error().Err(err).Msg(fmt.Sprintf("Failed to fsync heap file %d", heapfileIndex))
+		return nil, err
+	}
+
 	return hpm, nil
+}
+
+func heapFileName(number int) string {
+	return fmt.Sprintf("%s%s%d", heapFileNamePrefix, heapfileNameSepparate, number)
 }

@@ -7,7 +7,8 @@ import (
 )
 
 func TestLRUCache(t *testing.T) {
-	cache := NewLRUCache[int, int](10, true)
+	c := NewLRUCache[int, int](10)
+	cache := c.(*LRUCache[int, int])
 	for i := 0; i < 10; i++ {
 		cache.Put(i, i)
 	}
