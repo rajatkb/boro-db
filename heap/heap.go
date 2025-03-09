@@ -3,6 +3,7 @@ package heap
 import (
 	"boro-db/utils/checksums"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -20,6 +21,7 @@ import (
 Heap file
 ┌──────────────────────────────────────────────────────────────┐
 | crc (4byte) | pageCount (4byte) |                            |
+| start-address (8byte)                                        |
 |──────────────────────4kb metadata────────────────────────────|
 | ......                                                       |
 └──────────────────────────────────────────────────────────────┘
@@ -30,8 +32,8 @@ const heapFileNamePrefix = "heapFile"
 const heapfileNameSepparate = "-"
 
 type heapfilemeta struct {
-	heapfileNumber int
-	fd             int
+	addressSpaceStart uint64
+	fd                int
 	// serializable fields
 	pageCount uint32
 	buffer    []byte
@@ -39,11 +41,13 @@ type heapfilemeta struct {
 
 func (hpm *heapfilemeta) Serialize() {
 	binary.BigEndian.PutUint32(hpm.buffer[4:8], hpm.pageCount)
+	binary.BigEndian.PutUint64(hpm.buffer[8:16], hpm.addressSpaceStart)
 	checksums.CalculateCRC(hpm.buffer[0:4], hpm.buffer[4:])
 }
 
 func (hpm *heapfilemeta) Deserialize() error {
 	hpm.pageCount = binary.BigEndian.Uint32(hpm.buffer[4:8])
+	hpm.addressSpaceStart = binary.BigEndian.Uint64(hpm.buffer[8:16])
 	crcBuffer := make([]byte, 4)
 	checksums.CalculateCRC(crcBuffer, hpm.buffer[4:])
 	if !checksums.CompareCRC(crcBuffer, hpm.buffer[0:4]) {
@@ -61,18 +65,19 @@ func totalPagesInHeapFile(heapfileSize uint32, pageSize uint32) uint32 {
 }
 
 type fileSystemHeap struct {
-	logger                log.Logger
-	option                FileOptions
-	fileIdentifiers       []*heapfilemeta
-	totalAddressablePages uint64
-
-	totalPagesInHeapFile uint32
+	logger                     log.Logger
+	option                     FileOptions
+	fileIdentifiers            []*heapfilemeta
+	firstAddressInAddressSpace uint64
+	lastAddressInAddressSpace  uint64
+	startAddressMap            map[uint64]*heapfilemeta
+	totalPagesInHeapFile       uint32
 
 	heapFileLock *sync.RWMutex
 }
 
-// Truncate heap file to last page number
-func (fsh *fileSystemHeap) Truncate(lastPageNumber uint64) error {
+// TrimTail heap file to last page number
+func (fsh *fileSystemHeap) TrimTail(count uint64) error {
 
 	// no better way for this yet
 	// TODO :
@@ -80,11 +85,12 @@ func (fsh *fileSystemHeap) Truncate(lastPageNumber uint64) error {
 	fsh.heapFileLock.Lock()
 	defer fsh.heapFileLock.Unlock()
 
-	if fsh.totalAddressablePages < lastPageNumber {
-		return nil
+	if fsh.lastAddressInAddressSpace-fsh.firstAddressInAddressSpace+1 < count {
+		return fmt.Errorf("cannot trim heap file to less than %d pages", count)
 	}
 
-	newLastPageNumber := lastPageNumber
+	newLastPageNumber := fsh.lastAddressInAddressSpace - count
+
 	filesDeleted := 0
 
 	/*
@@ -99,36 +105,38 @@ func (fsh *fileSystemHeap) Truncate(lastPageNumber uint64) error {
 
 		pageSize := fsh.option.PageSizeByte
 
-		currentHeapFileStartPageNumber := uint64(fsh.totalPagesInHeapFile * uint32(i))
+		currentHeapFileStartPageNumber := fsh.fileIdentifiers[i].addressSpaceStart
 
-		if newLastPageNumber <= currentHeapFileStartPageNumber {
+		if newLastPageNumber < currentHeapFileStartPageNumber {
 			// Delete everything in current file
-			err := syscall.Unlink(filepath.Join(fsh.option.FileDirectory, heapFileName(i)))
+			err := syscall.Unlink(filepath.Join(fsh.option.FileDirectory, heapFileName(currentHeapFileStartPageNumber)))
 			if err != nil {
 				fsh.logger.Error().Err(err).Msg(fmt.Sprintf("Failed to delete heap file %d", i))
 				return err
 			}
-			fsh.totalAddressablePages -= uint64(fsh.fileIdentifiers[i].pageCount)
+			fsh.lastAddressInAddressSpace -= uint64(fsh.fileIdentifiers[i].pageCount)
+			delete(fsh.startAddressMap, currentHeapFileStartPageNumber)
 			filesDeleted++
 		} else {
 			// Truncate the file
-			newSize := newLastPageNumber - currentHeapFileStartPageNumber // making sure metadata is intact
-
+			newSize := newLastPageNumber - currentHeapFileStartPageNumber + 1 // making sure metadata is intact
+			prevPageCount := fsh.fileIdentifiers[i].pageCount
 			fsh.fileIdentifiers[i].pageCount = uint32(newSize)
 			fsh.fileIdentifiers[i].Serialize()
-			fsh.totalAddressablePages -= uint64(fsh.fileIdentifiers[i].pageCount)
-
 			_, err := syscall.Pwrite(fsh.fileIdentifiers[i].fd, fsh.fileIdentifiers[i].buffer, 0)
 			if err != nil {
 				fsh.logger.Error().Err(err).Msg(fmt.Sprintf("Failed to write heap file %d", i))
+				fsh.fileIdentifiers[i].pageCount = prevPageCount // restore values
+				return err
+			}
+			err = syscall.Fsync(fsh.fileIdentifiers[i].fd)
+			if err != nil {
+				fsh.logger.Error().Err(err).Msg(fmt.Sprintf("Failed to fsync heap file %d", fsh.fileIdentifiers[i].addressSpaceStart))
+				fsh.fileIdentifiers[i].pageCount = prevPageCount // restore values
 				return err
 			}
 
-			err = syscall.Fsync(fsh.fileIdentifiers[i].fd)
-			if err != nil {
-				fsh.logger.Error().Err(err).Msg(fmt.Sprintf("Failed to fsync heap file %d", fsh.fileIdentifiers[i].heapfileNumber))
-				return err
-			}
+			fsh.lastAddressInAddressSpace -= uint64(prevPageCount - uint32(newSize))
 
 			err = syscall.Ftruncate(fsh.fileIdentifiers[i].fd, int64(newSize*uint64(pageSize)+uint64(getHeapFileMetaSize(fsh.option))))
 			if err != nil {
@@ -141,13 +149,12 @@ func (fsh *fileSystemHeap) Truncate(lastPageNumber uint64) error {
 	}
 
 	fsh.fileIdentifiers = fsh.fileIdentifiers[:len(fsh.fileIdentifiers)-filesDeleted]
-	fsh.totalAddressablePages = lastPageNumber
 
 	return nil
 }
 
 // Add new heap file or extend existing one based on page count
-func (fsh *fileSystemHeap) AllocatePage(pageCount int) error {
+func (fsh *fileSystemHeap) ExtendBy(pageCount int) error {
 
 	fsh.heapFileLock.Lock()
 	defer fsh.heapFileLock.Unlock()
@@ -169,7 +176,7 @@ func (fsh *fileSystemHeap) AllocatePage(pageCount int) error {
 
 			extraPages = uint32(math.Min(float64(extraPages), float64(pagesRemainingToAllocate)))
 
-			hpf, err := createNewEmptyHeapFile(len(fsh.fileIdentifiers), fsh.option, fsh.logger)
+			hpf, err := createNewEmptyHeapFile(lastHeapFile.addressSpaceStart+uint64(lastHeapFile.pageCount), fsh.option, fsh.logger)
 
 			if err != nil {
 				fsh.logger.Error().Err(err).Msg(fmt.Sprintf("Failed to create new heap file %d", len(fsh.fileIdentifiers)))
@@ -186,7 +193,10 @@ func (fsh *fileSystemHeap) AllocatePage(pageCount int) error {
 			fsh.fileIdentifiers = append(fsh.fileIdentifiers, hpf)
 			lastHeapFile = hpf
 			pagesRemainingToAllocate -= uint64(extraPages)
-			fsh.totalAddressablePages += uint64(extraPages)
+			fsh.lastAddressInAddressSpace += uint64(extraPages)
+
+			fsh.startAddressMap[hpf.addressSpaceStart] = hpf
+
 		} else {
 			// extend current heap file to max heap file size in the file
 			// reduce page Remaining to allocate by that count
@@ -203,7 +213,7 @@ func (fsh *fileSystemHeap) AllocatePage(pageCount int) error {
 				return err
 			}
 
-			fsh.totalAddressablePages += uint64(extraPages)
+			fsh.lastAddressInAddressSpace += uint64(extraPages)
 			pagesRemainingToAllocate -= uint64(extraPages)
 		}
 
@@ -215,7 +225,7 @@ func (fsh *fileSystemHeap) AllocatePage(pageCount int) error {
 func (fsh *fileSystemHeap) allocatePagesInHeapFile(hpf *heapfilemeta, heapFileSize int64, extraPages int64) error {
 	err := syscall.Fallocate(hpf.fd, 0, heapFileSize, extraPages*int64(fsh.option.PageSizeByte))
 	if err != nil {
-		fsh.logger.Error().Err(err).Msg(fmt.Sprintf("Failed to extend heap file %d", hpf.heapfileNumber))
+		fsh.logger.Error().Err(err).Msg(fmt.Sprintf("Failed to extend heap file %d", hpf.addressSpaceStart))
 		return err
 	}
 	hpf.pageCount += uint32(extraPages)
@@ -223,13 +233,13 @@ func (fsh *fileSystemHeap) allocatePagesInHeapFile(hpf *heapfilemeta, heapFileSi
 	_, err = syscall.Pwrite(hpf.fd, hpf.buffer, 0)
 	if err != nil {
 		hpf.pageCount -= uint32(extraPages)
-		fsh.logger.Error().Err(err).Msg(fmt.Sprintf("Failed to write heap file %d", hpf.heapfileNumber))
+		fsh.logger.Error().Err(err).Msg(fmt.Sprintf("Failed to write heap file %d", hpf.addressSpaceStart))
 		return err
 	}
 
 	err = syscall.Fsync(hpf.fd)
 	if err != nil {
-		fsh.logger.Error().Err(err).Msg(fmt.Sprintf("Failed to fsync heap file %d", hpf.heapfileNumber))
+		fsh.logger.Error().Err(err).Msg(fmt.Sprintf("Failed to fsync heap file %d", hpf.addressSpaceStart))
 		return err
 	}
 
@@ -241,19 +251,31 @@ func (fsh *fileSystemHeap) Read(pageNumber uint64, buffer []byte, onRead func(er
 	heapFile := pageNumber / uint64(fsh.totalPagesInHeapFile)
 	heapFileOffset := pageNumber % uint64(fsh.totalPagesInHeapFile)
 
-	_, err := syscall.Pread(fsh.fileIdentifiers[heapFile].fd, buffer, int64(getHeapFileMetaSize(fsh.option))+int64(heapFileOffset*uint64(fsh.option.PageSizeByte)))
+	hpf, ok := fsh.startAddressMap[fsh.fileIdentifiers[heapFile].addressSpaceStart]
+
+	if !ok {
+		onRead(errors.New("page not found"))
+	}
+
+	_, err := syscall.Pread(hpf.fd, buffer, int64(getHeapFileMetaSize(fsh.option))+int64(heapFileOffset*uint64(fsh.option.PageSizeByte)))
 
 	onRead(err)
 }
 
 func (fsh *fileSystemHeap) Write(pageNumber uint64, buffer []byte, onWrite func(error)) {
 
-	heapFile := pageNumber / uint64(fsh.option.HeapFileSizeByte/fsh.option.PageSizeByte)
-	heapFileOffset := pageNumber % uint64(fsh.option.HeapFileSizeByte/fsh.option.PageSizeByte)
+	heapFile := pageNumber / uint64(fsh.totalPagesInHeapFile)
+	heapFileOffset := pageNumber % uint64(fsh.totalPagesInHeapFile)
 
-	_, err := syscall.Pwrite(fsh.fileIdentifiers[heapFile].fd, buffer, int64(getHeapFileMetaSize(fsh.option))+int64(heapFileOffset*uint64(fsh.option.PageSizeByte)))
+	hpf, ok := fsh.startAddressMap[fsh.fileIdentifiers[heapFile].addressSpaceStart]
 
-	if err := syscall.Fsync(fsh.fileIdentifiers[heapFile].fd); err != nil {
+	if !ok {
+		onWrite(errors.New("page not found"))
+	}
+
+	_, err := syscall.Pwrite(hpf.fd, buffer, int64(getHeapFileMetaSize(fsh.option))+int64(heapFileOffset*uint64(fsh.option.PageSizeByte)))
+
+	if err := syscall.Fsync(hpf.fd); err != nil {
 		fsh.logger.Error().Err(err).Msg(fmt.Sprintf("Failed to fsync heap file %d", heapFile))
 		onWrite(err)
 		return
@@ -262,10 +284,10 @@ func (fsh *fileSystemHeap) Write(pageNumber uint64, buffer []byte, onWrite func(
 	onWrite(err)
 }
 
-func (fsh *fileSystemHeap) MaxAddressablePage() uint64 {
+func (fsh *fileSystemHeap) ValidAddressRange() [2]uint64 {
 	fsh.heapFileLock.Lock()
 	defer fsh.heapFileLock.Unlock()
-	return fsh.totalAddressablePages
+	return [2]uint64{fsh.firstAddressInAddressSpace, fsh.lastAddressInAddressSpace}
 }
 
 func getHeapFileMetaSize(option FileOptions) uint32 {
@@ -307,7 +329,7 @@ func NewHeap(logger log.Logger, option FileOptions) (HeapFile, error) {
 
 	fileIdentifiers := make([]*heapfilemeta, 0, len(fileEntries))
 	fileIdentifiersMap := make(map[string]*heapfilemeta)
-	totalAddressablePages := uint64(0)
+
 	for _, fileEntry := range fileEntries {
 		if fileEntry.IsDir() {
 			continue
@@ -325,7 +347,7 @@ func NewHeap(logger log.Logger, option FileOptions) (HeapFile, error) {
 				return nil, err
 			}
 
-			fileNumber, err := strconv.ParseInt(strings.Split(fileEntry.Name(), heapfileNameSepparate)[1], 10, 64)
+			addressSpaceStart, err := strconv.ParseInt(strings.Split(fileEntry.Name(), heapfileNameSepparate)[1], 10, 64)
 
 			if err != nil {
 				logger.Error().Err(err).Msg(fmt.Sprintf("Failed to parse heap file number %s", fileEntry.Name()))
@@ -334,8 +356,8 @@ func NewHeap(logger log.Logger, option FileOptions) (HeapFile, error) {
 
 			// stash the fd and heap file number
 			hpf := &heapfilemeta{
-				fd:             fd,
-				heapfileNumber: int(fileNumber),
+				fd:                fd,
+				addressSpaceStart: uint64(addressSpaceStart),
 			}
 
 			fileIdentifiersMap[fileEntry.Name()] = hpf
@@ -351,7 +373,7 @@ func NewHeap(logger log.Logger, option FileOptions) (HeapFile, error) {
 			return nil, err
 		}
 		hpf.buffer = buffer
-		stat, err := os.Stat(filepath.Join(option.FileDirectory, heapFileName(hpf.heapfileNumber)))
+		stat, err := os.Stat(filepath.Join(option.FileDirectory, heapFileName(hpf.addressSpaceStart)))
 		// corrects the file meta based on the file size
 		// further correction logic can involve reading all the pages and checking how many of them are legit
 		// pages and then truncating them off
@@ -380,7 +402,7 @@ func NewHeap(logger log.Logger, option FileOptions) (HeapFile, error) {
 				return nil, err
 			}
 			if err := syscall.Fsync(hpf.fd); err != nil {
-				logger.Error().Err(err).Msg(fmt.Sprintf("Failed to fsync heap file %d", hpf.heapfileNumber))
+				logger.Error().Err(err).Msg(fmt.Sprintf("Failed to fsync heap file %d", hpf.addressSpaceStart))
 				return nil, err
 			}
 			hpf.Deserialize()
@@ -396,13 +418,18 @@ func NewHeap(logger log.Logger, option FileOptions) (HeapFile, error) {
 			return nil, err
 		}
 
-		totalAddressablePages += uint64(hpf.pageCount)
 		fileIdentifiers = append(fileIdentifiers, hpf)
 	}
 
 	sort.Slice(fileIdentifiers, func(i, j int) bool {
-		return fileIdentifiers[i].heapfileNumber < fileIdentifiers[j].heapfileNumber
+		return fileIdentifiers[i].addressSpaceStart < fileIdentifiers[j].addressSpaceStart
 	})
+
+	startAddressMap := make(map[uint64]*heapfilemeta, len(fileIdentifiers))
+
+	for _, hpf := range fileIdentifiers {
+		startAddressMap[hpf.addressSpaceStart] = hpf
+	}
 
 	if len(fileIdentifiers) == 0 {
 		hpm, err := createNewEmptyHeapFile(0, option, logger)
@@ -415,35 +442,37 @@ func NewHeap(logger log.Logger, option FileOptions) (HeapFile, error) {
 	}
 
 	return &fileSystemHeap{
-		logger:                logger,
-		fileIdentifiers:       fileIdentifiers,
-		totalAddressablePages: totalAddressablePages,
-		totalPagesInHeapFile:  totalPagesInHeapFile(option.HeapFileSizeByte, option.PageSizeByte),
-		heapFileLock:          &sync.RWMutex{},
-		option:                option,
+		logger:                     logger,
+		fileIdentifiers:            fileIdentifiers,
+		firstAddressInAddressSpace: fileIdentifiers[0].addressSpaceStart,
+		lastAddressInAddressSpace:  fileIdentifiers[len(fileIdentifiers)-1].addressSpaceStart + uint64(fileIdentifiers[len(fileIdentifiers)-1].pageCount) - 1,
+		totalPagesInHeapFile:       totalPagesInHeapFile(option.HeapFileSizeByte, option.PageSizeByte),
+		heapFileLock:               &sync.RWMutex{},
+		startAddressMap:            startAddressMap,
+		option:                     option,
 	}, nil
 }
 
-func createNewEmptyHeapFile(heapfileIndex int, option FileOptions, logger log.Logger) (*heapfilemeta, error) {
+func createNewEmptyHeapFile(addressSpaceStart uint64, option FileOptions, logger log.Logger) (*heapfilemeta, error) {
 
 	heapFileMetaSize := getHeapFileMetaSize(option)
 
-	fd, err := syscall.Open(filepath.Join(option.FileDirectory, heapFileName(heapfileIndex)), syscall.O_RDWR|syscall.O_DSYNC|syscall.O_CREAT, permissionBits)
+	fd, err := syscall.Open(filepath.Join(option.FileDirectory, heapFileName(addressSpaceStart)), syscall.O_RDWR|syscall.O_DSYNC|syscall.O_CREAT, permissionBits)
 	if err != nil {
-		logger.Error().Err(err).Msg(fmt.Sprintf("Failed to open heap file %d", heapfileIndex))
+		logger.Error().Err(err).Msg(fmt.Sprintf("Failed to open heap file %d", addressSpaceStart))
 		return nil, err
 	}
 
 	err = syscall.Fallocate(fd, 0, 0, int64(heapFileMetaSize))
 	if err != nil {
-		logger.Error().Err(err).Msg(fmt.Sprintf("Failed to allocate page in heap file %d", heapfileIndex))
+		logger.Error().Err(err).Msg(fmt.Sprintf("Failed to allocate page in heap file %d", addressSpaceStart))
 		return nil, err
 	}
 
 	hpm := &heapfilemeta{
-		pageCount:      0,
-		fd:             fd,
-		heapfileNumber: heapfileIndex,
+		pageCount:         0,
+		fd:                fd,
+		addressSpaceStart: addressSpaceStart,
 	}
 
 	hpm.buffer = make([]byte, heapFileMetaSize)
@@ -452,17 +481,17 @@ func createNewEmptyHeapFile(heapfileIndex int, option FileOptions, logger log.Lo
 	_, err = syscall.Pwrite(fd, hpm.buffer, 0)
 
 	if err != nil {
-		logger.Error().Err(err).Msg(fmt.Sprintf("Failed to write heap file %d", heapfileIndex))
+		logger.Error().Err(err).Msg(fmt.Sprintf("Failed to write heap file %d", addressSpaceStart))
 		return nil, err
 	}
 	if err := syscall.Fsync(fd); err != nil {
-		logger.Error().Err(err).Msg(fmt.Sprintf("Failed to fsync heap file %d", heapfileIndex))
+		logger.Error().Err(err).Msg(fmt.Sprintf("Failed to fsync heap file %d", addressSpaceStart))
 		return nil, err
 	}
 
 	return hpm, nil
 }
 
-func heapFileName(number int) string {
+func heapFileName(number uint64) string {
 	return fmt.Sprintf("%s%s%d", heapFileNamePrefix, heapfileNameSepparate, number)
 }

@@ -1,7 +1,6 @@
 package paging
 
 import (
-	"boro-db/heap"
 	"boro-db/utils/checksums"
 	"encoding/binary"
 	"fmt"
@@ -12,82 +11,52 @@ import (
 /*
 PagefileBlock inside heap file
 ┌──────────────────────────────────────────────────────────────┐
-| checkSum (4 bytes)                                           |
+| checkSum (4 bytes) | LSN (4byte)                             |
 |──────────────────────────────────────────────────────────────|
-| LSN (8 bytes)                                                |
 | ......                                                       |
 |-------------------------- System Page Size (4096) -----------|
-| checkSum (4 bytes)                                           |
-|──────────────────────────────────────────────────────────────|
-| LSN (8 bytes)                                                |
-| ......                                                       |
-|-------------------------- System Page Size (4096) -----------|
-| ...............reapeat x PageCountInBlock....................|
 └──────────────────────────────────────────────────────────────┘
-
-A single pageFileBlock is composed of multiple pages
-A page is a 4kb or whatever the OS prescribes as the smallest atomic unit of writable data
-The unit can be larger as well so consider that as well
-
-A pageBlock is a collection of such pages.
-A buffer pool in itself cannot do a durable write to disk.
-So a PageBlock Write has to be broken down into multiple page writes to make it actually durable
-- So all modification will be translated into a physiological change by the PageBlock write function
--- A write function in PageBlock will capture the information where which mods were done and return the
-pages interacted with for the mods.
--- A standard write from PageBuffer system in the WAL will look <pageNumber , pageOffset , lengthOfDatauffer , newDataBuffer>
--- This can now be translated by the Record manager which is deploying the write command into <pageNumber , pageOffset , lengthOfData , operationCode >
--- This will allow us to interact with only that page when interacting with the changes
--- a default implementation from the WAL can provide direct physical changes done to the pages for sake of simplicity i.e physical logging
 */
 const pageBufferBlockByteOffset = 8
 
 var ErrOutOfBounds = fmt.Errorf("out of bounds")
 
-type PageFileBlock struct {
+type Page struct {
 
 	// buffer contains entire page data use getter and setters
-	// to change the data
-	pageCountInBlock uint32
-	pageNumber       uint64
-	dirty            bool
-	buffer           []byte
-	crcMatch         bool
-	mutex            sync.RWMutex
+	pageNumber uint64
+	dirty      bool
+	buffer     []byte
+	crcMatch   bool
+	// TODO : remove the mutex lock , and try a CAS operation + Scheduler
+	mutex      sync.RWMutex
+	currentLSN uint32
 }
 
-func PageFileBlockBufferMaxSize(pageSizeByte uint32) uint32 {
-	return pageSizeByte - pageBufferBlockByteOffset
-}
-
-func (pfb *PageFileBlock) Size() int {
+func (pfb *Page) Size() int {
 	return (len(pfb.buffer))
 }
 
-func (pfb *PageFileBlock) GetPageMetaData() []byte {
-
-	return pfb.buffer[0:pageBufferBlockByteOffset]
-}
-
-func (pfb *PageFileBlock) GetCheckSumBuffer() []byte {
+func (pfb *Page) GetCheckSumBuffer() []byte {
 	return pfb.buffer[0:4]
 }
 
-func (pfb *PageFileBlock) GetPostCRCBuffer() []byte {
+func (pfb *Page) GetPostCRCBuffer() []byte {
 	return pfb.buffer[4:]
 }
 
-func (pfb *PageFileBlock) GetPageBuffer() []byte {
-	return pfb.buffer[pageBufferBlockByteOffset:]
+func (pfb *Page) GetLSNBUffer() []byte {
+	return pfb.buffer[4:8]
 }
 
-func (pfb *PageFileBlock) CheckCRCMatch() bool {
+func (pfb *Page) CheckCRCMatch() bool {
 
 	crc := crc32.ChecksumIEEE(pfb.GetPostCRCBuffer())
-
 	crcMatch := crc == binary.BigEndian.Uint32(pfb.GetCheckSumBuffer())
+
 	pfb.crcMatch = crcMatch
-	return crcMatch
+
+	return pfb.crcMatch
 }
 
 // TODO: MUST BE DONE
@@ -95,7 +64,7 @@ func (pfb *PageFileBlock) CheckCRCMatch() bool {
 // update the write method accrodingly
 // we will require now to have LSN (last synced number) and also CSN (current sync number)
 // this is to indicate the status of the page file block updated status
-func (pfb *PageFileBlock) SetPageBuffer(offset int, buffer []byte, option *heap.FileOptions) error {
+func (pfb *Page) SetPageBuffer(offset int, buffer []byte, currentLSN uint32) error {
 
 	pfb.mutex.Lock()
 	defer pfb.mutex.Unlock()
@@ -106,15 +75,19 @@ func (pfb *PageFileBlock) SetPageBuffer(offset int, buffer []byte, option *heap.
 
 	dataRegion := pfb.buffer[pageBufferBlockByteOffset+offset : pageBufferBlockByteOffset+offset+len(buffer)]
 	copy(dataRegion, buffer)
-
+	pfb.currentLSN = currentLSN
 	pfb.dirty = true
+
 	return nil
 }
 
-func (pfb *PageFileBlock) serialize() []byte {
+func (pfb *Page) serialize() []byte {
+	pfb.mutex.RLock()
+	defer pfb.mutex.RUnlock()
 
 	if pfb.dirty {
 		checksums.CalculateCRC(pfb.GetCheckSumBuffer(), pfb.GetPostCRCBuffer())
+		binary.BigEndian.PutUint32(pfb.GetLSNBUffer(), pfb.currentLSN)
 	}
 
 	return pfb.buffer

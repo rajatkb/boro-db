@@ -10,9 +10,12 @@ type FileOptions struct {
 }
 
 type HeapFile interface {
-	Truncate(lastPageNumber uint64) error
-	AllocatePage(pageCount int) error
+	// TrimHead(firstPageNumber uint64) error
+	// Trims the address space to the last page number
+	TrimTail(count uint64) error
+	// ExtendBy adds the number of pages to the address
+	ExtendBy(pageCount int) error
 	Read(pageNumber uint64, buffer []byte, onRead func(error))
 	Write(pageNumber uint64, buffer []byte, onWrite func(error))
-	MaxAddressablePage() uint64
+	ValidAddressRange() [2]uint64
 }

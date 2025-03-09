@@ -18,16 +18,9 @@ What is a buffer pool or paging system for us
 - the page file system is a way to abstract the loading of page blocks and flushing same
 - pageBlock = page + metadata
 - page = 4kb which is a OS / Hardware standard. this is also what our WAL logs will posibly follow
-- pageBlock = 4mb which is something our database can control.
-
-Why do we need a pageBlock. Because database tries to increase page locality and prefers writing large amount of data in one go
-This layer does two things
-- Decouples from hardware pagesize and disk limitations
-- Gives an in memory cache to work with for the heap read / writes
 */
 type PageSystemOption struct {
 	heap.FileOptions
-	PageBlockSize                uint32
 	PageBufferCacheSize          int
 	MultiThreadedWritesDisabled  bool
 	BufferPoolEvictionIntervalms int
@@ -35,13 +28,13 @@ type PageSystemOption struct {
 }
 
 type PageSystem interface {
-	AllocatePage(pageCount int) error
+
 	/*
 		- read the pageBlock from in memory cache
 		- if in memory cache is not available then read from disk
 
 	*/
-	ReadPageBlock(pageNumber uint64, onRead func(*PageFileBlock, error))
+	ReadPage(pageNumber uint64, onRead func(*Page, error))
 
 	/*
 		- FlushPageBlock on the memory copy of the data
@@ -52,22 +45,18 @@ type PageSystem interface {
 		- the bufferpool will batch bunch of writes together and attempt to unload the writes in a single batched request
 		-
 	*/
-	FlushPageBlock(pfb *PageFileBlock, onWrite func(error))
-	MaxAddressablePage() uint64
+	FlushPageBlock(pfb *Page, onWrite func(error))
+
 	Flush() error
 }
 
 type pageSystem struct {
-	heap    heap.HeapFile
+	heapfs  heap.HeapFile
 	options PageSystemOption
-	cache   cache.Cache[uint64, *PageFileBlock]
+	cache   cache.Cache[uint64, *Page]
 }
 
-func (ps *pageSystem) AllocatePage(pageCount int) error {
-	return ps.heap.AllocatePage(pageCount * int(ps.options.PageBlockSize))
-}
-
-func (ps *pageSystem) ReadPageBlock(pageNumber uint64, onRead func(*PageFileBlock, error)) {
+func (ps *pageSystem) ReadPage(pageNumber uint64, onRead func(*Page, error)) {
 
 	pfb, ok := ps.cache.Get(pageNumber)
 
@@ -81,12 +70,11 @@ func (ps *pageSystem) ReadPageBlock(pageNumber uint64, onRead func(*PageFileBloc
 	// hold the buffer memory with in
 	// expand the array judiciously not at once
 	// use the PageFileBlock to create a free size list which always points to first free block
-	pfb = &PageFileBlock{
-		pageCountInBlock: ps.options.PageBlockSize,
-		pageNumber:       pageNumber,
-		buffer:           make([]byte, ps.options.PageBlockSize*ps.options.PageSizeByte),
+	pfb = &Page{
+		pageNumber: pageNumber,
+		buffer:     make([]byte, ps.options.PageSizeByte),
 	}
-	ps.heap.Read(pageNumber, pfb.buffer, func(err error) {
+	ps.heapfs.Read(pageNumber, pfb.buffer, func(err error) {
 		if err != nil {
 			onRead(nil, err)
 		}
@@ -96,10 +84,10 @@ func (ps *pageSystem) ReadPageBlock(pageNumber uint64, onRead func(*PageFileBloc
 	})
 }
 
-func (ps *pageSystem) FlushPageBlock(pfb *PageFileBlock, onWrite func(error)) {
+func (ps *pageSystem) FlushPageBlock(pfb *Page, onWrite func(error)) {
 	pfb.mutex.RLock()
 	defer pfb.mutex.RUnlock()
-	ps.heap.Write(pfb.pageNumber, pfb.serialize(), func(err error) {
+	ps.heapfs.Write(pfb.pageNumber, pfb.serialize(), func(err error) {
 		if err != nil {
 			onWrite(err)
 		}
@@ -107,31 +95,29 @@ func (ps *pageSystem) FlushPageBlock(pfb *PageFileBlock, onWrite func(error)) {
 	})
 }
 
-func (ps *pageSystem) MaxAddressablePage() uint64 {
-	return ps.heap.MaxAddressablePage() / uint64(ps.options.PageBlockSize)
-}
-
 func (ps *pageSystem) Flush() error {
 	var flushWg sync.WaitGroup
-	ps.cache.Range(func(u uint64, pfb *PageFileBlock) bool {
+	ps.cache.Range(func(u uint64, pfb *Page) bool {
 		pfb.mutex.RLock()
 		if pfb.dirty {
 			// if dirty , do not wait for the write op to complete
-			// incremental semaphor
+			// increment semaphor
 			// start page write op in disk
 			// don't unlock the mutex until the write is complete (its a read lock so all reads are still allowed)
 			// writes would be blocked (internally dity is set to false and writes turn dirty to true)
 			// we unlock only once write is complete
+
 			flushWg.Add(1)
-			ps.heap.Write(pfb.pageNumber, pfb.serialize(), func(err error) {
+			ps.heapfs.Write(pfb.pageNumber, pfb.serialize(), func(err error) {
 				if err != nil {
 					log.Error().Err(err).Msg(fmt.Sprintf("error flushing page : %d", pfb.pageNumber))
+				} else {
+					pfb.dirty = false
 				}
-				pfb.dirty = false
 				pfb.mutex.RUnlock()
 				flushWg.Done()
 			})
-			return false
+			return true
 		}
 		pfb.mutex.RUnlock()
 		return true
@@ -140,15 +126,17 @@ func (ps *pageSystem) Flush() error {
 	return nil
 }
 
-func NewPageSystem(logger log.Logger, options PageSystemOption) (PageSystem, error) {
-	heap, err := heap.NewHeap(logger, options.FileOptions)
-	if err != nil {
-		return nil, err
-	}
+/*
+Caching on top of heap file
+heap files are raw file and buffer space
+PageSystem gives heapfile page block structure
+*/
+func NewPageSystem(logger log.Logger, heapfs heap.HeapFile, options PageSystemOption) (PageSystem, error) {
 
-	cache := cache.NewLRUCache[uint64, *PageFileBlock](options.PageBufferCacheSize)
+	cache := cache.NewLRUCache[uint64, *Page](options.PageBufferCacheSize)
 	ps := &pageSystem{
-		heap:    heap,
+		heapfs: heapfs,
+
 		options: options,
 		cache:   cache,
 	}
@@ -171,7 +159,7 @@ func NewPageSystem(logger log.Logger, options PageSystemOption) (PageSystem, err
 					continue
 				}
 
-				cache.Compact(func(u uint64, pfb *PageFileBlock) bool {
+				cache.Compact(func(u uint64, pfb *Page) bool {
 					pfb.mutex.RLock()
 					if pfb.dirty {
 						// if dirty , do not wait for the write op to complete
@@ -181,7 +169,7 @@ func NewPageSystem(logger log.Logger, options PageSystemOption) (PageSystem, err
 						// writes would be blocked (internally dity is set to false and writes turn dirty to true)
 						// we unlock only once write is complete
 						wg.Add(1)
-						heap.Write(pfb.pageNumber, pfb.serialize(), func(err error) {
+						heapfs.Write(pfb.pageNumber, pfb.serialize(), func(err error) {
 							if err != nil {
 								log.Error().Err(err).Msg(fmt.Sprintf("error flushing page : %d", pfb.pageNumber))
 							}
