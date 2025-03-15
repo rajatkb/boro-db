@@ -21,10 +21,10 @@ func TestHeapFileOperations(t *testing.T) {
 
 	t.Run("Test heap file creation", func(t *testing.T) {
 
-		heapFile, err := NewHeap(*logging.CreateDebugLogger(), FileOptions{
+		heapFile, err := NewHeap(*logging.CreateDebugLogger(), &FileOptions{
 			PageSizeByte:     4096,
 			FileDirectory:    dir,
-			HeapFileSizeByte: 4096 * 5, // 4 page + 1 meta
+			HeapFileSizeByte: 4096 * 6, // 4 page + 2 meta
 		})
 
 		assert.Nil(t, err)
@@ -37,10 +37,10 @@ func TestHeapFileOperations(t *testing.T) {
 
 		t.Run("Test by reloading the file system", func(t *testing.T) {
 			// reload the same file system
-			heapFile, err := NewHeap(*logging.CreateDebugLogger(), FileOptions{
+			heapFile, err := NewHeap(*logging.CreateDebugLogger(), &FileOptions{
 				PageSizeByte:     4096,
 				FileDirectory:    dir,
-				HeapFileSizeByte: 4096 * 5, // 4 page + 1 meta
+				HeapFileSizeByte: 4096 * 6, // 4 page + 1 meta
 			})
 
 			assert.Nil(t, err)
@@ -54,10 +54,10 @@ func TestHeapFileOperations(t *testing.T) {
 		t.Run("Test for allocating more page space", func(t *testing.T) {
 
 			// reload the same file system
-			heapFile, err := NewHeap(*logging.CreateDebugLogger(), FileOptions{
+			heapFile, err := NewHeap(*logging.CreateDebugLogger(), &FileOptions{
 				PageSizeByte:     4096,
 				FileDirectory:    dir,
-				HeapFileSizeByte: 4096 * 5, // 4 page + 1 meta
+				HeapFileSizeByte: 4096 * 6, // 4 page + 2 meta
 			})
 
 			assert.Nil(t, err)
@@ -89,10 +89,10 @@ func TestHeapFileOperations(t *testing.T) {
 		t.Run("Test for truncation", func(t *testing.T) {
 
 			// reload the same file system
-			heapFile, err := NewHeap(*logging.CreateDebugLogger(), FileOptions{
+			heapFile, err := NewHeap(*logging.CreateDebugLogger(), &FileOptions{
 				PageSizeByte:     4096,
 				FileDirectory:    dir,
-				HeapFileSizeByte: 4096 * 5, // 4 page + 1 meta
+				HeapFileSizeByte: 4096 * 6, // 4 page + 2 meta
 			})
 
 			assert.Nil(t, err)
@@ -106,7 +106,7 @@ func TestHeapFileOperations(t *testing.T) {
 			assert.Equal(t, uint32(4), hpf.fileIdentifiers[3].pageCount)
 			assert.Equal(t, uint32(3), hpf.fileIdentifiers[4].pageCount)
 
-			heapFile.TrimTail(10)
+			heapFile.TrimHead(10)
 			assert.Len(t, hpf.fileIdentifiers, 3)
 			assert.Equal(t, uint64(8), hpf.lastAddressInAddressSpace)
 			assert.Equal(t, uint32(4), hpf.fileIdentifiers[0].pageCount)
@@ -117,10 +117,10 @@ func TestHeapFileOperations(t *testing.T) {
 
 		t.Run("Test for reading and writing", func(t *testing.T) {
 			// reload the same file system
-			heapFile, err := NewHeap(*logging.CreateDebugLogger(), FileOptions{
+			heapFile, err := NewHeap(*logging.CreateDebugLogger(), &FileOptions{
 				PageSizeByte:     4096,
 				FileDirectory:    dir,
-				HeapFileSizeByte: 4096 * 5, // 4 page + 1 meta
+				HeapFileSizeByte: 4096 * 6, // 4 page + 2 meta
 			})
 
 			assert.Nil(t, err)

@@ -7,12 +7,13 @@ type FileOptions struct {
 	PageSizeByte     uint32 // size of one page block in bytes
 	FileDirectory    string // file directory where the heap files are located
 	HeapFileSizeByte uint32 // size of heap file inclusive of the metadata. count of page = heapfileSizeByte / pageSizeByte - 1
+	RequireFreeList  bool   // use only if doing random allocation and revokation
 }
 
 type HeapFile interface {
 	// TrimHead(firstPageNumber uint64) error
 	// Trims the address space to the last page number
-	TrimTail(count uint64) error
+	TrimHead(count uint64) error
 	// ExtendBy adds the number of pages to the address
 	ExtendBy(pageCount int) error
 	Read(pageNumber uint64, buffer []byte, onRead func(error))
