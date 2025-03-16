@@ -9,18 +9,17 @@ type FreeList interface {
 	GetPages(count uint64) ([]uint64, error)
 	// Release pages back to the free list
 	ReleasePages(pages []uint64) error
-	LastModifiedRange() [2]uint64
 	FreePagesAvailable() uint64 // Returns the number of free pages available
+	CurrentAddressRange() [2]uint64
 }
 
 type BitmapFreeList struct {
-	bitmap        []byte
-	next          []int // Linked list of free pages
-	head          int   // Head of the free list
-	modifiedRange [2]uint64
-	start         uint64 // Start of the address range
-	end           uint64 // End of the address range
-	freePages     uint64 // Counter for free pages available
+	bitmap    []byte
+	next      []int  // Linked list of free pages
+	head      int    // Head of the free list
+	start     uint64 // Start of the address range
+	end       uint64 // End of the address range
+	freePages uint64 // Counter for free pages available
 }
 
 func (fl *BitmapFreeList) FreePagesAvailable() uint64 {
@@ -47,8 +46,8 @@ func (fl *BitmapFreeList) GetPages(count uint64) ([]uint64, error) {
 		fl.freePages--             // Decrement the free pages counter
 	}
 
-	fl.head = current             // Update the head to the new top of the free list
-	fl.updateModifiedRange(pages) // Update modified range with allocated pages
+	fl.head = current // Update the head to the new top of the free list
+
 	return pages, nil
 }
 
@@ -74,38 +73,11 @@ func (fl *BitmapFreeList) ReleasePages(pages []uint64) error {
 		fl.freePages++                        // Increment the free pages counter
 	}
 
-	fl.updateModifiedRange(pages) // Update modified range with released pages
 	return nil
 }
 
-func (fl *BitmapFreeList) LastModifiedRange() [2]uint64 {
-	return fl.modifiedRange
-}
-
-func (fl *BitmapFreeList) updateModifiedRange(pages []uint64) {
-	if len(pages) == 0 {
-		return
-	}
-
-	// Find the minimum (low) and maximum (high) page numbers
-	low := pages[0]
-	high := pages[0]
-	for _, page := range pages {
-		if page < low {
-			low = page
-		}
-		if page > high {
-			high = page
-		}
-	}
-
-	// Update the modified range
-	if fl.modifiedRange[0] > low {
-		fl.modifiedRange[0] = low
-	}
-	if fl.modifiedRange[1] < high {
-		fl.modifiedRange[1] = high
-	}
+func (fl *BitmapFreeList) CurrentAddressRange() [2]uint64 {
+	return [2]uint64{fl.start, fl.end}
 }
 
 /*
@@ -148,12 +120,11 @@ func NewBitmapFreeList(bitmap []byte, start, end uint64) FreeList {
 	}
 
 	return &BitmapFreeList{
-		bitmap:        bitmap,
-		next:          next,
-		head:          head,
-		modifiedRange: [2]uint64{end, start}, // Initialize with the specified range
-		start:         start,
-		end:           end,
-		freePages:     freePages, // Initialize the free pages counter
+		bitmap:    bitmap,
+		next:      next,
+		head:      head,
+		start:     start,
+		end:       end,
+		freePages: freePages, // Initialize the free pages counter
 	}
 }

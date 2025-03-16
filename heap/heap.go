@@ -74,14 +74,13 @@ func totalPagesInHeapFile(option *FileOptions) uint32 {
 }
 
 func getFreeListSizeBytes(option *FileOptions) uint32 {
-	return uint32(math.Ceil(float64(option.HeapFileSizeByte-option.PageSizeByte) / (8 * float64(option.PageSizeByte))))
+	maxBytesNeeded := math.Ceil(float64(option.HeapFileSizeByte-option.PageSizeByte) / (8 * float64(option.PageSizeByte)))
+	return uint32(math.Ceil(maxBytesNeeded/float64(option.PageSizeByte))) * option.PageSizeByte
 }
 
 func getHeapFileMetaSize(option *FileOptions) uint32 {
 	// add the free page size requirement per heap file
 	freeListSize := getFreeListSizeBytes(option)
-
-	freeListSize = uint32(math.Max(float64(freeListSize), float64(option.PageSizeByte)))
 
 	return uint32(option.PageSizeByte) + freeListSize
 }
@@ -114,9 +113,11 @@ func (fsh *fileSystemHeap) Free(pageNumbers []uint64) error {
 	fsh.logger.Debug().Msgf("Free %d pages heap : %s", len(pageNumbers), fsh.option.FileDirectory)
 	freeListSizeBytes := getFreeListSizeBytes(fsh.option)
 	freeListToSync := make(map[*heapfilemeta][][]uint64)
+
 	for _, pageNumber := range pageNumbers {
 		pageNumber -= fsh.firstAddressInAddressSpace
-		heapFileMeta, ok := fsh.startAddressMap[pageNumber/uint64(fsh.maxTotalPagesInHeapFile)]
+		heapFileStartAddress := pageNumber - pageNumber%uint64(fsh.maxTotalPagesInHeapFile)
+		heapFileMeta, ok := fsh.startAddressMap[heapFileStartAddress]
 		if !ok {
 			fsh.logger.Debug().Msgf("Page number %d not found in heap file : %s", pageNumber, fsh.option.FileDirectory)
 			continue
@@ -139,7 +140,7 @@ func (fsh *fileSystemHeap) Free(pageNumbers []uint64) error {
 
 	for heapFileMeta, freeListIdxs := range freeListToSync {
 		for idx, pages := range freeListIdxs {
-			if len(pages) == 0 {
+			if len(pages) != 0 {
 
 				heapFileMeta.freelist[idx].ReleasePages(pages)
 
@@ -150,6 +151,7 @@ func (fsh *fileSystemHeap) Free(pageNumbers []uint64) error {
 				_, err := syscall.Pwrite(heapFileMeta.fd, currentFreePageBuffer, int64((idx+1)*int(fsh.option.PageSizeByte)))
 
 				if err != nil {
+					heapFileMeta.freelist[idx].GetPages(uint64(len(pages))) // grab the same pages in exact same order
 					fsh.logger.Error().Msgf("Error writing to heap file : %s", err.Error())
 					return err
 				}
@@ -178,7 +180,7 @@ func (fsh *fileSystemHeap) Malloc(pageCount uint64) ([]uint64, error) {
 	if remainingPages > 0 {
 		return nil, ErrNotEnoughSpace
 	}
-
+	freeListSizeBytes := getFreeListSizeBytes(fsh.option)
 	remainingPages = pageCount
 	finalPages := make([]uint64, pageCount)
 
@@ -188,7 +190,7 @@ func (fsh *fileSystemHeap) Malloc(pageCount uint64) ([]uint64, error) {
 		for idx, freeList := range hpf.freelist {
 			pages, _ := freeList.GetPages(remainingPages)
 
-			freePageDataSpace := hpf.buffer[fsh.option.PageSizeByte:getFreeListSizeBytes(fsh.option)]
+			freePageDataSpace := hpf.buffer[fsh.option.PageSizeByte:freeListSizeBytes]
 			currentFreePageBuffer := freePageDataSpace[idx*int(fsh.option.PageSizeByte) : (idx+1)*int(fsh.option.PageSizeByte)]
 
 			_, err := syscall.Pwrite(hpf.fd, currentFreePageBuffer, int64((idx+1)*int(fsh.option.PageSizeByte)))
@@ -200,7 +202,7 @@ func (fsh *fileSystemHeap) Malloc(pageCount uint64) ([]uint64, error) {
 			}
 
 			for i := 0; i < len(pages); i++ {
-				pages[i] = hpf.addressSpaceStart + uint64(idx)*uint64(fsh.option.PageSizeByte)
+				pages[i] = hpf.addressSpaceStart + uint64(idx)*uint64(fsh.option.PageSizeByte*8) + pages[i]
 				finalPages[j] = pages[i]
 				j++
 			}
@@ -215,7 +217,6 @@ func (fsh *fileSystemHeap) Malloc(pageCount uint64) ([]uint64, error) {
 	return finalPages, nil
 }
 
-// TrimHead heap file to last page number
 func (fsh *fileSystemHeap) TrimHead(count uint64) error {
 
 	// no better way for this yet
@@ -290,6 +291,52 @@ func (fsh *fileSystemHeap) TrimHead(count uint64) error {
 	}
 
 	fsh.fileIdentifiers = fsh.fileIdentifiers[:len(fsh.fileIdentifiers)-filesDeleted]
+
+	return nil
+}
+
+func (fsh *fileSystemHeap) TrimTailHeapFiles(count uint64) error {
+
+	// no better way for this yet
+	// TODO :
+	// ensure lock at heap file level not at a global level maybe
+	fsh.heapFileLock.Lock()
+	defer fsh.heapFileLock.Unlock()
+
+	if fsh.lastAddressInAddressSpace-fsh.firstAddressInAddressSpace+1 < count {
+		return fmt.Errorf("cannot trim heap file to less than %d pages", count)
+	}
+
+	newFirstPageNumber := fsh.firstAddressInAddressSpace + count
+
+	filesDeleted := 0
+
+	/*
+		deletes / truncates file as per page Count provided
+		where pageRangeTodelete = MaxPageCount - 100 + MaxPageCount + 100
+		heapFile 1 - 100 - MaxPageCount
+		heapfile 2 - 0 - MaxPageCount
+		heapfile 3 - 0 - 100
+	*/
+
+	for i := 0; i < len(fsh.fileIdentifiers); i-- {
+
+		currentHeapFileLastPageNumber := fsh.fileIdentifiers[i].addressSpaceStart + uint64(fsh.fileIdentifiers[i].pageCount) - 1
+
+		if newFirstPageNumber > currentHeapFileLastPageNumber {
+			// Delete everything in current file
+			err := syscall.Unlink(filepath.Join(fsh.option.FileDirectory, heapFileName(currentHeapFileLastPageNumber)))
+			if err != nil {
+				fsh.logger.Error().Err(err).Msg(fmt.Sprintf("Failed to delete heap file %d", i))
+				return err
+			}
+			fsh.firstAddressInAddressSpace += uint64(fsh.fileIdentifiers[i].pageCount)
+			delete(fsh.startAddressMap, currentHeapFileLastPageNumber)
+			filesDeleted++
+		}
+	}
+
+	fsh.fileIdentifiers = fsh.fileIdentifiers[filesDeleted:]
 
 	return nil
 }

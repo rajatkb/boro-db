@@ -126,12 +126,12 @@ func TestHeapFileOperations(t *testing.T) {
 
 			assert.Nil(t, err)
 
-			pages, err := heapFile.Malloc(12)
+			pages, err := heapFile.Malloc(9)
 			assert.Nil(t, err)
-			assert.Len(t, pages, 12)
+			assert.Len(t, pages, 9)
 
-			assert.Equal(t, []uint64{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}, pages)
-			assert.Equal(t, 0, heapFile.FreePagesAvailable())
+			assert.Equal(t, []uint64{0, 1, 2, 3, 4, 5, 6, 7, 8}, pages)
+			assert.Equal(t, uint64(0), heapFile.FreePagesAvailable())
 
 			var wg sync.WaitGroup
 			wg.Add(1)
@@ -143,7 +143,7 @@ func TestHeapFileOperations(t *testing.T) {
 
 			err = heapFile.Free(pages)
 			assert.Nil(t, err)
-			assert.Equal(t, 9, heapFile.FreePagesAvailable())
+			assert.Equal(t, uint64(9), heapFile.FreePagesAvailable())
 
 			data := make([]byte, 11)
 			wg.Add(1)
