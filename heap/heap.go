@@ -18,6 +18,8 @@ import (
 	"github.com/phuslu/log"
 )
 
+var ErrNotEnoughSpace = fmt.Errorf("not enough space")
+
 /*
 Heap file
 ┌──────────────────────────────────────────────────────────────┐
@@ -71,13 +73,13 @@ func totalPagesInHeapFile(option *FileOptions) uint32 {
 	return (option.HeapFileSizeByte - getHeapFileMetaSize(option)) / option.PageSizeByte
 }
 
-func getFreeListSize(option *FileOptions) uint32 {
+func getFreeListSizeBytes(option *FileOptions) uint32 {
 	return uint32(math.Ceil(float64(option.HeapFileSizeByte-option.PageSizeByte) / (8 * float64(option.PageSizeByte))))
 }
 
 func getHeapFileMetaSize(option *FileOptions) uint32 {
 	// add the free page size requirement per heap file
-	freeListSize := getFreeListSize(option)
+	freeListSize := getFreeListSizeBytes(option)
 
 	freeListSize = uint32(math.Max(float64(freeListSize), float64(option.PageSizeByte)))
 
@@ -91,9 +93,126 @@ type fileSystemHeap struct {
 	firstAddressInAddressSpace uint64
 	lastAddressInAddressSpace  uint64
 	startAddressMap            map[uint64]*heapfilemeta
-	totalPagesInHeapFile       uint32
+	maxTotalPagesInHeapFile    uint32
 	heapMetaSize               uint32
 	heapFileLock               *sync.RWMutex
+}
+
+func (fsh *fileSystemHeap) FreePagesAvailable() uint64 {
+	size := 0
+	for _, hpf := range fsh.fileIdentifiers {
+		for _, fl := range hpf.freelist {
+			size += int(fl.FreePagesAvailable())
+		}
+	}
+	return uint64(size)
+}
+
+func (fsh *fileSystemHeap) Free(pageNumbers []uint64) error {
+	fsh.heapFileLock.Lock()
+	defer fsh.heapFileLock.Unlock()
+	fsh.logger.Debug().Msgf("Free %d pages heap : %s", len(pageNumbers), fsh.option.FileDirectory)
+	freeListSizeBytes := getFreeListSizeBytes(fsh.option)
+	freeListToSync := make(map[*heapfilemeta][][]uint64)
+	for _, pageNumber := range pageNumbers {
+		pageNumber -= fsh.firstAddressInAddressSpace
+		heapFileMeta, ok := fsh.startAddressMap[pageNumber/uint64(fsh.maxTotalPagesInHeapFile)]
+		if !ok {
+			fsh.logger.Debug().Msgf("Page number %d not found in heap file : %s", pageNumber, fsh.option.FileDirectory)
+			continue
+		}
+		pageOffset := pageNumber % uint64(fsh.maxTotalPagesInHeapFile)
+
+		if pageOffset >= uint64(heapFileMeta.pageCount) {
+			fsh.logger.Debug().Msgf("Page number %d not found in heap file : %s", pageNumber, fsh.option.FileDirectory)
+			continue
+		}
+
+		freeListIdx := pageOffset / uint64(fsh.option.PageSizeByte*8)
+		freeListSlot := pageOffset % uint64(fsh.option.PageSizeByte*8)
+
+		if _, ok := freeListToSync[heapFileMeta]; !ok {
+			freeListToSync[heapFileMeta] = make([][]uint64, freeListSizeBytes/fsh.option.PageSizeByte)
+		}
+		freeListToSync[heapFileMeta][freeListIdx] = append(freeListToSync[heapFileMeta][freeListIdx], freeListSlot)
+	}
+
+	for heapFileMeta, freeListIdxs := range freeListToSync {
+		for idx, pages := range freeListIdxs {
+			if len(pages) == 0 {
+
+				heapFileMeta.freelist[idx].ReleasePages(pages)
+
+				freePageDataSpace := heapFileMeta.buffer[fsh.option.PageSizeByte:freeListSizeBytes]
+
+				currentFreePageBuffer := freePageDataSpace[idx*int(fsh.option.PageSizeByte) : (idx+1)*int(fsh.option.PageSizeByte)]
+
+				_, err := syscall.Pwrite(heapFileMeta.fd, currentFreePageBuffer, int64((idx+1)*int(fsh.option.PageSizeByte)))
+
+				if err != nil {
+					fsh.logger.Error().Msgf("Error writing to heap file : %s", err.Error())
+					return err
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+func (fsh *fileSystemHeap) Malloc(pageCount uint64) ([]uint64, error) {
+	fsh.heapFileLock.Lock()
+	defer fsh.heapFileLock.Unlock()
+
+	remainingPages := pageCount
+
+	for _, hpf := range fsh.fileIdentifiers {
+		for _, freeList := range hpf.freelist {
+			remainingPages -= freeList.FreePagesAvailable()
+			if remainingPages <= 0 {
+				break
+			}
+		}
+	}
+
+	if remainingPages > 0 {
+		return nil, ErrNotEnoughSpace
+	}
+
+	remainingPages = pageCount
+	finalPages := make([]uint64, pageCount)
+
+	j := 0
+
+	for _, hpf := range fsh.fileIdentifiers {
+		for idx, freeList := range hpf.freelist {
+			pages, _ := freeList.GetPages(remainingPages)
+
+			freePageDataSpace := hpf.buffer[fsh.option.PageSizeByte:getFreeListSizeBytes(fsh.option)]
+			currentFreePageBuffer := freePageDataSpace[idx*int(fsh.option.PageSizeByte) : (idx+1)*int(fsh.option.PageSizeByte)]
+
+			_, err := syscall.Pwrite(hpf.fd, currentFreePageBuffer, int64((idx+1)*int(fsh.option.PageSizeByte)))
+
+			if err != nil {
+				fsh.logger.Error().Err(err).Msg("Error while writing FreeSpaceInfo to heap file")
+				freeList.ReleasePages(pages)
+				return nil, err
+			}
+
+			for i := 0; i < len(pages); i++ {
+				pages[i] = hpf.addressSpaceStart + uint64(idx)*uint64(fsh.option.PageSizeByte)
+				finalPages[j] = pages[i]
+				j++
+			}
+			remainingPages -= uint64(len(pages))
+			if remainingPages <= 0 {
+				break
+			}
+		}
+	}
+	fsh.logger.Debug().Msgf("Malloc %d pages heap : %s", pageCount, fsh.option.FileDirectory)
+
+	return finalPages, nil
 }
 
 // TrimHead heap file to last page number
@@ -164,6 +283,8 @@ func (fsh *fileSystemHeap) TrimHead(count uint64) error {
 				return err
 			}
 
+			createFreeSizePages(fsh.fileIdentifiers[i], getHeapFileMetaSize(fsh.option), fsh.option)
+
 			break
 		}
 	}
@@ -192,7 +313,7 @@ func (fsh *fileSystemHeap) ExtendBy(pageCount int) error {
 			// update the total addressable pages
 			// reduce the pageRemainingToAllocate by that count
 
-			extraPages := fsh.totalPagesInHeapFile
+			extraPages := fsh.maxTotalPagesInHeapFile
 
 			extraPages = uint32(math.Min(float64(extraPages), float64(pagesRemainingToAllocate)))
 
@@ -271,8 +392,8 @@ func (fsh *fileSystemHeap) allocatePagesInHeapFile(hpf *heapfilemeta, heapFileSi
 
 func (fsh *fileSystemHeap) Read(pageNumber uint64, buffer []byte, onRead func(error)) {
 
-	heapFile := pageNumber / uint64(fsh.totalPagesInHeapFile)
-	heapFileOffset := pageNumber % uint64(fsh.totalPagesInHeapFile)
+	heapFile := pageNumber / uint64(fsh.maxTotalPagesInHeapFile)
+	heapFileOffset := pageNumber % uint64(fsh.maxTotalPagesInHeapFile)
 
 	hpf, ok := fsh.startAddressMap[fsh.fileIdentifiers[heapFile].addressSpaceStart]
 
@@ -287,8 +408,8 @@ func (fsh *fileSystemHeap) Read(pageNumber uint64, buffer []byte, onRead func(er
 
 func (fsh *fileSystemHeap) Write(pageNumber uint64, buffer []byte, onWrite func(error)) {
 
-	heapFile := pageNumber / uint64(fsh.totalPagesInHeapFile)
-	heapFileOffset := pageNumber % uint64(fsh.totalPagesInHeapFile)
+	heapFile := pageNumber / uint64(fsh.maxTotalPagesInHeapFile)
+	heapFileOffset := pageNumber % uint64(fsh.maxTotalPagesInHeapFile)
 
 	hpf, ok := fsh.startAddressMap[fsh.fileIdentifiers[heapFile].addressSpaceStart]
 
@@ -447,12 +568,6 @@ func NewHeap(logger log.Logger, option *FileOptions) (HeapFile, error) {
 		return fileIdentifiers[i].addressSpaceStart < fileIdentifiers[j].addressSpaceStart
 	})
 
-	startAddressMap := make(map[uint64]*heapfilemeta, len(fileIdentifiers))
-
-	for _, hpf := range fileIdentifiers {
-		startAddressMap[hpf.addressSpaceStart] = hpf
-	}
-
 	if len(fileIdentifiers) == 0 {
 		hpm, err := createNewEmptyHeapFile(0, option, logger)
 		if err != nil {
@@ -463,12 +578,18 @@ func NewHeap(logger log.Logger, option *FileOptions) (HeapFile, error) {
 		fileIdentifiers = append(fileIdentifiers, hpm)
 	}
 
+	startAddressMap := make(map[uint64]*heapfilemeta, len(fileIdentifiers))
+
+	for _, hpf := range fileIdentifiers {
+		startAddressMap[hpf.addressSpaceStart] = hpf
+	}
+
 	return &fileSystemHeap{
 		logger:                     logger,
 		fileIdentifiers:            fileIdentifiers,
 		firstAddressInAddressSpace: fileIdentifiers[0].addressSpaceStart,
 		lastAddressInAddressSpace:  fileIdentifiers[len(fileIdentifiers)-1].addressSpaceStart + uint64(fileIdentifiers[len(fileIdentifiers)-1].pageCount) - 1,
-		totalPagesInHeapFile:       totalPagesInHeapFile(option),
+		maxTotalPagesInHeapFile:    totalPagesInHeapFile(option),
 		heapMetaSize:               heapFileMetaSize,
 		heapFileLock:               &sync.RWMutex{},
 		startAddressMap:            startAddressMap,
@@ -478,8 +599,9 @@ func NewHeap(logger log.Logger, option *FileOptions) (HeapFile, error) {
 
 func createFreeSizePages(hpf *heapfilemeta, heapFileMetaSize uint32, option *FileOptions) {
 	hpf.freelist = make([]freelist.FreeList, 0, heapFileMetaSize/option.PageSizeByte)
-	for i := 0; i < int(heapFileMetaSize/option.PageSizeByte); i++ {
-		buffer := hpf.buffer[0:option.PageSizeByte]
+	numFreeListPages := int((heapFileMetaSize - option.PageSizeByte) / option.PageSizeByte)
+	for i := 0; i < numFreeListPages; i++ {
+		buffer := hpf.buffer[option.PageSizeByte:]
 		hpf.freelist = append(hpf.freelist, freelist.NewBitmapFreeList(buffer[i*int(option.PageSizeByte):(i+1)*int(option.PageSizeByte)], 0, uint64(hpf.pageCount)))
 	}
 }

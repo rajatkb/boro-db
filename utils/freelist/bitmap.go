@@ -10,7 +10,7 @@ type FreeList interface {
 	// Release pages back to the free list
 	ReleasePages(pages []uint64) error
 	LastModifiedRange() [2]uint64
-	FreePageAvailable() bool
+	FreePagesAvailable() uint64 // Returns the number of free pages available
 }
 
 type BitmapFreeList struct {
@@ -20,10 +20,11 @@ type BitmapFreeList struct {
 	modifiedRange [2]uint64
 	start         uint64 // Start of the address range
 	end           uint64 // End of the address range
+	freePages     uint64 // Counter for free pages available
 }
 
-func (fl *BitmapFreeList) FreePageAvailable() bool {
-	return fl.head != -1
+func (fl *BitmapFreeList) FreePagesAvailable() uint64 {
+	return fl.freePages
 }
 
 func (fl *BitmapFreeList) GetPages(count uint64) ([]uint64, error) {
@@ -33,9 +34,6 @@ func (fl *BitmapFreeList) GetPages(count uint64) ([]uint64, error) {
 
 	var pages []uint64
 	current := fl.head
-	if current == -1 {
-		return nil, errors.New("not enough free pages available")
-	}
 
 	for i := uint64(0); i < count; i++ {
 		if current == -1 {
@@ -46,6 +44,7 @@ func (fl *BitmapFreeList) GetPages(count uint64) ([]uint64, error) {
 		prev := current
 		current = fl.next[current] // Move to the next free page
 		fl.next[prev] = -1         // Remove the allocated page from the free list
+		fl.freePages--             // Decrement the free pages counter
 	}
 
 	fl.head = current             // Update the head to the new top of the free list
@@ -72,6 +71,7 @@ func (fl *BitmapFreeList) ReleasePages(pages []uint64) error {
 		fl.bitmap[page/8] &^= 1 << (page % 8) // Mark page as free
 		fl.next[page] = fl.head               // Point the released page to the current head
 		fl.head = int(page)                   // Make the released page the new head
+		fl.freePages++                        // Increment the free pages counter
 	}
 
 	fl.updateModifiedRange(pages) // Update modified range with released pages
@@ -117,8 +117,9 @@ func (fl *BitmapFreeList) updateModifiedRange(pages []uint64) {
 func NewBitmapFreeList(bitmap []byte, start, end uint64) FreeList {
 	size := len(bitmap) * 8
 	next := make([]int, size)
-	head := -1 // Start with no free pages
-	prev := -1 // Track the previous free page
+	head := -1             // Start with no free pages
+	prev := -1             // Track the previous free page
+	freePages := uint64(0) // Counter for free pages
 
 	// Initialize the linked list of free pages based on the bitmap
 	for i := 0; i < size; i++ {
@@ -134,7 +135,8 @@ func NewBitmapFreeList(bitmap []byte, start, end uint64) FreeList {
 			} else {
 				next[prev] = i // Point the previous free page to the current free page
 			}
-			prev = i // Update the previous free page
+			prev = i    // Update the previous free page
+			freePages++ // Increment the free pages counter
 		} else {
 			next[i] = -1 // Mark as allocated
 		}
@@ -152,5 +154,6 @@ func NewBitmapFreeList(bitmap []byte, start, end uint64) FreeList {
 		modifiedRange: [2]uint64{end, start}, // Initialize with the specified range
 		start:         start,
 		end:           end,
+		freePages:     freePages, // Initialize the free pages counter
 	}
 }

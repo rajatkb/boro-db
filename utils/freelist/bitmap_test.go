@@ -17,7 +17,7 @@ func TestBitMapFreeList(t *testing.T) {
 	assert.Equal(t, pages, []uint64{0, 1, 2, 3, 4, 5, 6, 7, 8, 9})
 	assert.Equal(t, uint8(255), bitmap[0])
 	assert.Equal(t, uint8(3), bitmap[1])
-	assert.True(t, freelist.FreePageAvailable())
+	assert.True(t, freelist.FreePagesAvailable() == 37)
 
 	freelist.ReleasePages([]uint64{10}) // no-op
 
@@ -36,6 +36,6 @@ func TestBitMapFreeList(t *testing.T) {
 
 	assert.Nil(t, err)
 	assert.Equal(t, 39, len(pages))
-	assert.False(t, freelist.FreePageAvailable())
+	assert.True(t, freelist.FreePagesAvailable() == 0)
 
 }

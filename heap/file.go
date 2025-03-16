@@ -19,4 +19,7 @@ type HeapFile interface {
 	Read(pageNumber uint64, buffer []byte, onRead func(error))
 	Write(pageNumber uint64, buffer []byte, onWrite func(error))
 	ValidAddressRange() [2]uint64
+	Malloc(count uint64) ([]uint64, error)
+	Free(pageNumbers []uint64) error
+	FreePagesAvailable() uint64
 }

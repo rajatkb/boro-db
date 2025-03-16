@@ -34,6 +34,7 @@ func TestHeapFileOperations(t *testing.T) {
 		assert.Len(t, hpf.fileIdentifiers, 1)
 		assert.Equal(t, uint64(3), hpf.lastAddressInAddressSpace)
 		assert.Equal(t, uint32(4), hpf.fileIdentifiers[0].pageCount)
+		assert.Equal(t, uint64(4), hpf.FreePagesAvailable())
 
 		t.Run("Test by reloading the file system", func(t *testing.T) {
 			// reload the same file system
@@ -48,7 +49,7 @@ func TestHeapFileOperations(t *testing.T) {
 			assert.Len(t, hpf.fileIdentifiers, 1)
 			assert.Equal(t, uint64(3), hpf.lastAddressInAddressSpace)
 			assert.Equal(t, uint32(4), hpf.fileIdentifiers[0].pageCount)
-
+			assert.Equal(t, uint64(4), hpf.FreePagesAvailable())
 		})
 
 		t.Run("Test for allocating more page space", func(t *testing.T) {
@@ -125,6 +126,13 @@ func TestHeapFileOperations(t *testing.T) {
 
 			assert.Nil(t, err)
 
+			pages, err := heapFile.Malloc(12)
+			assert.Nil(t, err)
+			assert.Len(t, pages, 12)
+
+			assert.Equal(t, []uint64{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}, pages)
+			assert.Equal(t, 0, heapFile.FreePagesAvailable())
+
 			var wg sync.WaitGroup
 			wg.Add(1)
 			heapFile.Write(4, []byte("Hello World"), func(err error) {
@@ -132,6 +140,10 @@ func TestHeapFileOperations(t *testing.T) {
 				wg.Done()
 			})
 			wg.Wait()
+
+			err = heapFile.Free(pages)
+			assert.Nil(t, err)
+			assert.Equal(t, 9, heapFile.FreePagesAvailable())
 
 			data := make([]byte, 11)
 			wg.Add(1)
