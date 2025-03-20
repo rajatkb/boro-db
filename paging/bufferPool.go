@@ -20,11 +20,12 @@ What is a buffer pool or paging system for us
 - page = 4kb which is a OS / Hardware standard. this is also what our WAL logs will posibly follow
 */
 type PageSystemOption struct {
-	heap.FileOptions
+	heap.HeapFileOptions
 	PageBufferCacheSize          int
 	MultiThreadedWritesDisabled  bool
 	BufferPoolEvictionIntervalms int
 	BufferPoolFlushIntervalms    int
+	EnablePageMeta               bool
 }
 
 type PageSystem interface {
@@ -46,7 +47,9 @@ type PageSystem interface {
 		-
 	*/
 	FlushPageBlock(pfb *Page, onWrite func(error))
-
+	/*
+		- Flush all the pages in the buffer pool force flush
+	*/
 	Flush() error
 }
 
@@ -71,16 +74,16 @@ func (ps *pageSystem) ReadPage(pageNumber uint64, onRead func(*Page, error)) {
 	// expand the array judiciously not at once
 	// use the PageFileBlock to create a free size list which always points to first free block
 	pfb = &Page{
-		pageNumber: pageNumber,
-		buffer:     make([]byte, ps.options.PageSizeByte),
+		pageNumber:      pageNumber,
+		buffer:          make([]byte, ps.options.PageSizeByte),
+		pageMetaEnabled: ps.options.EnablePageMeta,
 	}
 	ps.heapfs.Read(pageNumber, pfb.buffer, func(err error) {
 		if err != nil {
 			onRead(nil, err)
 		}
-
-		onRead(pfb, nil)
 		ps.cache.Put(pageNumber, pfb)
+		onRead(pfb, nil)
 	})
 }
 

@@ -11,6 +11,7 @@ type FreeList interface {
 	ReleasePages(pages []uint64) error
 	FreePagesAvailable() uint64 // Returns the number of free pages available
 	CurrentAddressRange() [2]uint64
+	IsPageFree(page uint64) bool
 }
 
 type BitmapFreeList struct {
@@ -20,6 +21,13 @@ type BitmapFreeList struct {
 	start     uint64 // Start of the address range
 	end       uint64 // End of the address range
 	freePages uint64 // Counter for free pages available
+}
+
+func (fl *BitmapFreeList) IsPageFree(page uint64) bool {
+	if page < fl.start || page >= fl.end {
+		return false
+	}
+	return fl.bitmap[page/8]&(1<<(page%8)) == 0
 }
 
 func (fl *BitmapFreeList) FreePagesAvailable() uint64 {

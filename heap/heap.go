@@ -44,7 +44,7 @@ type heapfilemeta struct {
 	pageCount uint32
 	buffer    []byte
 	freelist  []freelist.FreeList
-	options   *FileOptions
+	options   *HeapFileOptions
 }
 
 func (hpm *heapfilemeta) SerializeMetaData() {
@@ -69,16 +69,16 @@ func (hpm *heapfilemeta) SizeBytes() uint32 {
 	return getHeapFileMetaSize(hpm.options) + hpm.pageCount*hpm.options.PageSizeByte
 }
 
-func totalPagesInHeapFile(option *FileOptions) uint32 {
+func totalPagesInHeapFile(option *HeapFileOptions) uint32 {
 	return (option.HeapFileSizeByte - getHeapFileMetaSize(option)) / option.PageSizeByte
 }
 
-func getFreeListSizeBytes(option *FileOptions) uint32 {
+func getFreeListSizeBytes(option *HeapFileOptions) uint32 {
 	maxBytesNeeded := math.Ceil(float64(option.HeapFileSizeByte-option.PageSizeByte) / (8 * float64(option.PageSizeByte)))
 	return uint32(math.Ceil(maxBytesNeeded/float64(option.PageSizeByte))) * option.PageSizeByte
 }
 
-func getHeapFileMetaSize(option *FileOptions) uint32 {
+func getHeapFileMetaSize(option *HeapFileOptions) uint32 {
 	// add the free page size requirement per heap file
 	freeListSize := getFreeListSizeBytes(option)
 
@@ -87,7 +87,7 @@ func getHeapFileMetaSize(option *FileOptions) uint32 {
 
 type fileSystemHeap struct {
 	logger                     log.Logger
-	option                     *FileOptions
+	option                     *HeapFileOptions
 	fileIdentifiers            []*heapfilemeta
 	firstAddressInAddressSpace uint64
 	lastAddressInAddressSpace  uint64
@@ -95,6 +95,26 @@ type fileSystemHeap struct {
 	maxTotalPagesInHeapFile    uint32
 	heapMetaSize               uint32
 	heapFileLock               *sync.RWMutex
+}
+
+func (fsh *fileSystemHeap) IsPageFree(pageNumber uint64) bool {
+	fsh.heapFileLock.RLock()
+	defer fsh.heapFileLock.RUnlock()
+
+	if pageNumber < fsh.firstAddressInAddressSpace || pageNumber > fsh.lastAddressInAddressSpace {
+		return false
+	}
+
+	heapFileStartAddress := pageNumber - pageNumber%uint64(fsh.maxTotalPagesInHeapFile)
+
+	heapFile := fsh.startAddressMap[heapFileStartAddress]
+
+	pageOffset := pageNumber % uint64(fsh.maxTotalPagesInHeapFile)
+
+	freeListIdx := pageOffset / uint64(fsh.option.PageSizeByte*8)
+	freeListSlot := pageOffset % uint64(fsh.option.PageSizeByte*8)
+
+	return heapFile.freelist[freeListIdx].IsPageFree(freeListSlot)
 }
 
 func (fsh *fileSystemHeap) FreePagesAvailable() uint64 {
@@ -115,7 +135,6 @@ func (fsh *fileSystemHeap) Free(pageNumbers []uint64) error {
 	freeListToSync := make(map[*heapfilemeta][][]uint64)
 
 	for _, pageNumber := range pageNumbers {
-		pageNumber -= fsh.firstAddressInAddressSpace
 		heapFileStartAddress := pageNumber - pageNumber%uint64(fsh.maxTotalPagesInHeapFile)
 		heapFileMeta, ok := fsh.startAddressMap[heapFileStartAddress]
 		if !ok {
@@ -486,7 +505,7 @@ Creates heapfile in sequence , starts with a heap file of size page size
 if list of heap file is empty. If not loads the heapfile file pointer
 and stores them.
 */
-func NewHeap(logger log.Logger, option *FileOptions) (HeapFile, error) {
+func NewHeap(logger log.Logger, option *HeapFileOptions) (HeapFile, error) {
 
 	// create heap meta file to lock the heap file status like
 	// pageFileSize
@@ -644,7 +663,7 @@ func NewHeap(logger log.Logger, option *FileOptions) (HeapFile, error) {
 	}, nil
 }
 
-func createFreeSizePages(hpf *heapfilemeta, heapFileMetaSize uint32, option *FileOptions) {
+func createFreeSizePages(hpf *heapfilemeta, heapFileMetaSize uint32, option *HeapFileOptions) {
 	hpf.freelist = make([]freelist.FreeList, 0, heapFileMetaSize/option.PageSizeByte)
 	numFreeListPages := int((heapFileMetaSize - option.PageSizeByte) / option.PageSizeByte)
 	for i := 0; i < numFreeListPages; i++ {
@@ -653,7 +672,7 @@ func createFreeSizePages(hpf *heapfilemeta, heapFileMetaSize uint32, option *Fil
 	}
 }
 
-func createNewEmptyHeapFile(addressSpaceStart uint64, option *FileOptions, logger log.Logger) (*heapfilemeta, error) {
+func createNewEmptyHeapFile(addressSpaceStart uint64, option *HeapFileOptions, logger log.Logger) (*heapfilemeta, error) {
 
 	heapFileMetaSize := getHeapFileMetaSize(option)
 

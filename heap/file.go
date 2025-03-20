@@ -3,7 +3,7 @@ package heap
 const MIN_PAGE_SIZE = uint32(4096)                        // 4kb
 const MAX_HEAP_FILE_SIZE = uint32(2 * 1024 * 1024 * 1024) // 1GB
 
-type FileOptions struct {
+type HeapFileOptions struct {
 	PageSizeByte     uint32 // size of one page block in bytes
 	FileDirectory    string // file directory where the heap files are located
 	HeapFileSizeByte uint32 // size of heap file inclusive of the metadata. count of page = heapfileSizeByte / pageSizeByte - 1
@@ -31,4 +31,7 @@ type HeapFile interface {
 	Malloc(count uint64) ([]uint64, error)
 	Free(pageNumbers []uint64) error
 	FreePagesAvailable() uint64
+	// Checks if given page is free or not. if it out of range return false
+	// use it always before Read / Write if you care about allocation
+	IsPageFree(pageNumber uint64) bool
 }

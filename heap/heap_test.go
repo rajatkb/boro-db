@@ -21,7 +21,7 @@ func TestHeapFileOperations(t *testing.T) {
 
 	t.Run("Test heap file creation", func(t *testing.T) {
 
-		heapFile, err := NewHeap(*logging.CreateDebugLogger(), &FileOptions{
+		heapFile, err := NewHeap(*logging.CreateDebugLogger(), &HeapFileOptions{
 			PageSizeByte:     4096,
 			FileDirectory:    dir,
 			HeapFileSizeByte: 4096 * 6, // 4 page + 2 meta
@@ -38,7 +38,7 @@ func TestHeapFileOperations(t *testing.T) {
 
 		t.Run("Test by reloading the file system", func(t *testing.T) {
 			// reload the same file system
-			heapFile, err := NewHeap(*logging.CreateDebugLogger(), &FileOptions{
+			heapFile, err := NewHeap(*logging.CreateDebugLogger(), &HeapFileOptions{
 				PageSizeByte:     4096,
 				FileDirectory:    dir,
 				HeapFileSizeByte: 4096 * 6, // 4 page + 1 meta
@@ -55,7 +55,7 @@ func TestHeapFileOperations(t *testing.T) {
 		t.Run("Test for allocating more page space", func(t *testing.T) {
 
 			// reload the same file system
-			heapFile, err := NewHeap(*logging.CreateDebugLogger(), &FileOptions{
+			heapFile, err := NewHeap(*logging.CreateDebugLogger(), &HeapFileOptions{
 				PageSizeByte:     4096,
 				FileDirectory:    dir,
 				HeapFileSizeByte: 4096 * 6, // 4 page + 2 meta
@@ -90,7 +90,7 @@ func TestHeapFileOperations(t *testing.T) {
 		t.Run("Test for truncation", func(t *testing.T) {
 
 			// reload the same file system
-			heapFile, err := NewHeap(*logging.CreateDebugLogger(), &FileOptions{
+			heapFile, err := NewHeap(*logging.CreateDebugLogger(), &HeapFileOptions{
 				PageSizeByte:     4096,
 				FileDirectory:    dir,
 				HeapFileSizeByte: 4096 * 6, // 4 page + 2 meta
@@ -118,7 +118,7 @@ func TestHeapFileOperations(t *testing.T) {
 
 		t.Run("Test for reading and writing", func(t *testing.T) {
 			// reload the same file system
-			heapFile, err := NewHeap(*logging.CreateDebugLogger(), &FileOptions{
+			heapFile, err := NewHeap(*logging.CreateDebugLogger(), &HeapFileOptions{
 				PageSizeByte:     4096,
 				FileDirectory:    dir,
 				HeapFileSizeByte: 4096 * 6, // 4 page + 2 meta

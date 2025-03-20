@@ -1,15 +1,47 @@
 package main
 
-const PAGE_SIZE = 4096 // 4KB
+import (
+	"boro-db/filesystem"
+	"boro-db/heap"
+	"boro-db/logging"
+	"boro-db/paging"
+)
 
 func main() {
-	// logger := logging.CreateDebugLogger()
-	// fileOps := file.NewHeapDiskFileReaderWriter(logger, file.FileOptions{PageSizeByte: PAGE_SIZE, FileDirectory: "./data"})
-	// pager := paging.NewPagingStrategy[records.PageManager, records.PageManagerTranslator](records.NewPageRecordsManager, fileOps, logger, paging.PagingOptions{
-	// 	PageStrategy: paging.SimpleLRUStrategy,
-	// })
+	logger := logging.CreateDebugLogger()
 
-	// defer pager.Flush()
-	// defer fileOps.Close()
+	heapFileOptions := heap.HeapFileOptions{
+		PageSizeByte:     4096,
+		FileDirectory:    "./test",
+		HeapFileSizeByte: 1024 * 1024 * 1024, // 1GB
+		RequireFreeList:  true,
+	}
+	fs, err := filesystem.NewFileSystem(*logger, &filesystem.FileSystemOptions{
+		HeapFileOptions: heapFileOptions,
+		PageSystemOption: paging.PageSystemOption{
+			HeapFileOptions:              heapFileOptions,
+			PageBufferCacheSize:          1024 * 1024,
+			MultiThreadedWritesDisabled:  false,
+			BufferPoolEvictionIntervalms: 10000,
+			BufferPoolFlushIntervalms:    1000,
+			EnablePageMeta:               false,
+		},
+	})
 
+	if err != nil {
+		logger.Error().Err(err).Msg("failed to create filesystem")
+		return
+	}
+
+	pages, err := fs.Malloc(1024)
+
+	fs.Write(pages[0], func(p *paging.Page, err error) {
+		p.SetPageBuffer(0, []byte("hello world"), 0)
+	})
+
+	fs.Read(pages[0], func(p *paging.Page, err error) {
+		p.GetPageBuffer(func(b []byte) {
+			logger.Info().Msg(string(b))
+		})
+	})
 }

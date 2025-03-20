@@ -29,27 +29,49 @@ type Page struct {
 	buffer     []byte
 	crcMatch   bool
 	// TODO : remove the mutex lock , and try a CAS operation + Scheduler
-	mutex      sync.RWMutex
-	currentLSN uint32
+	mutex           sync.RWMutex
+	currentLSN      uint32
+	pageMetaEnabled bool
 }
 
 func (pfb *Page) Size() int {
+
+	if pfb.pageMetaEnabled {
+		return len(pfb.buffer) - pageBufferBlockByteOffset
+	}
+
 	return (len(pfb.buffer))
 }
 
 func (pfb *Page) GetCheckSumBuffer() []byte {
-	return pfb.buffer[0:4]
+
+	if pfb.pageMetaEnabled {
+		return pfb.buffer[0:4]
+	}
+
+	return nil
 }
 
 func (pfb *Page) GetPostCRCBuffer() []byte {
-	return pfb.buffer[4:]
+	if pfb.pageMetaEnabled {
+		return pfb.buffer[4:]
+	}
+	return nil
 }
 
 func (pfb *Page) GetLSNBUffer() []byte {
-	return pfb.buffer[4:8]
+
+	if pfb.pageMetaEnabled {
+		return pfb.buffer[4:8]
+	}
+	return nil
 }
 
 func (pfb *Page) CheckCRCMatch() bool {
+
+	if !pfb.pageMetaEnabled {
+		return true
+	}
 
 	crc := crc32.ChecksumIEEE(pfb.GetPostCRCBuffer())
 	crcMatch := crc == binary.BigEndian.Uint32(pfb.GetCheckSumBuffer())
@@ -59,11 +81,6 @@ func (pfb *Page) CheckCRCMatch() bool {
 	return pfb.crcMatch
 }
 
-// TODO: MUST BE DONE
-// add a new method to represent multiple page files creating a single block
-// update the write method accrodingly
-// we will require now to have LSN (last synced number) and also CSN (current sync number)
-// this is to indicate the status of the page file block updated status
 func (pfb *Page) SetPageBuffer(offset int, buffer []byte, currentLSN uint32) error {
 
 	pfb.mutex.Lock()
@@ -81,11 +98,21 @@ func (pfb *Page) SetPageBuffer(offset int, buffer []byte, currentLSN uint32) err
 	return nil
 }
 
+func (pfb *Page) GetPageBuffer(onRead func([]byte)) {
+	pfb.mutex.RLock()
+	defer pfb.mutex.RUnlock()
+	if pfb.pageMetaEnabled {
+		onRead(pfb.buffer[pageBufferBlockByteOffset:])
+	} else {
+		onRead(pfb.buffer)
+	}
+}
+
 func (pfb *Page) serialize() []byte {
 	pfb.mutex.RLock()
 	defer pfb.mutex.RUnlock()
 
-	if pfb.dirty {
+	if pfb.dirty && pfb.pageMetaEnabled {
 		checksums.CalculateCRC(pfb.GetCheckSumBuffer(), pfb.GetPostCRCBuffer())
 		binary.BigEndian.PutUint32(pfb.GetLSNBUffer(), pfb.currentLSN)
 	}
