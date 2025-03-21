@@ -3,17 +3,16 @@ simple database written in golang
 
 # Plan
 - [x] heap file management system
-- [ ] write ahead log system on top of heap
-- [ ] file managements system using WAL for crash recovery for directory records
+    - [ ] add benchmark test suite
+    - [ ] add I/O uring for file reads 
 - [x] page buffer manager
-- [ ] crash recovery system (ARES) ?
-- [ ] Records management system on top of page system
-- [ ] Skip List index for page system
-- [ ] multi thread / shard per core architecture implementation
-- [ ] transaction support (decide isolation system)
-- [ ] index + page garbage collection
-- [ ] I/O multiplex and io-uring usage
-- [ ] data compression and layout
-- [ ] Data structure support for keys - List, Set, HashMap , Sorted Set
-- [ ] Structured record manager
-- [ ] Query engine
+    - [ ] change interface for batched writes + reads
+    - [ ] vectorized reads + writes with IO Uring
+    - [ ] page pool creation with page buffer
+- [ ] write ahead log system on top of heap for Physical logging
+- [x] File system interface
+    - [ ] investigate bottlenecks of poor locks usage, lockless maps ? lock less lists ? improve LRU please !
+    - [ ] check if heap modifications can be lock free and atleast mallocs / free / checks can be lock free
+- [ ] KV using fs interface
+    - [ ] lsm using pager + heap
+    - [ ] b+ tree for indexes alone
