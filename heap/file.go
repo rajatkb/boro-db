@@ -7,7 +7,6 @@ type HeapFileOptions struct {
 	PageSizeByte        uint32 // size of one page block in bytes
 	FileDirectory       string // file directory where the heap files are located
 	MaxHeapFileSizeByte uint32 // size of heap file inclusive of the metadata. count of page = heapfileSizeByte / pageSizeByte - 1
-	RequireFreeList     bool   // use only if doing random allocation and revokation
 }
 
 type HeapFile interface {

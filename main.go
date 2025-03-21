@@ -14,14 +14,12 @@ func main() {
 		PageSizeByte:        4096,
 		FileDirectory:       "./test",
 		MaxHeapFileSizeByte: 1024 * 1024 * 1024, // 1GB
-		RequireFreeList:     true,
 	}
 	fs, err := filesystem.NewFileSystem(*logger, &filesystem.FileSystemOptions{
 		HeapFileOptions: heapFileOptions,
 		PageSystemOption: paging.PageSystemOption{
 			HeapFileOptions:              heapFileOptions,
 			PageBufferCacheSize:          1024 * 1024,
-			MultiThreadedWritesDisabled:  false,
 			BufferPoolEvictionIntervalms: 10000,
 			BufferPoolFlushIntervalms:    1000,
 			EnablePageMeta:               false,

@@ -22,7 +22,6 @@ What is a buffer pool or paging system for us
 type PageSystemOption struct {
 	heap.HeapFileOptions
 	PageBufferCacheSize          int
-	MultiThreadedWritesDisabled  bool
 	BufferPoolEvictionIntervalms int
 	BufferPoolFlushIntervalms    int
 	EnablePageMeta               bool
