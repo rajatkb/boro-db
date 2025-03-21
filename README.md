@@ -5,7 +5,7 @@ simple database written in golang
 - [x] heap file management system
 - [ ] write ahead log system on top of heap
 - [ ] file managements system using WAL for crash recovery for directory records
-- [ ] page buffer manager
+- [x] page buffer manager
 - [ ] crash recovery system (ARES) ?
 - [ ] Records management system on top of page system
 - [ ] Skip List index for page system

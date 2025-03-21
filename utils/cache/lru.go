@@ -40,7 +40,7 @@ func (c *LRUCache[K, V]) Range(onEach func(K, V) bool) {
 	head := c.listHead
 
 	// post compaction just iterate as usual
-	for {
+	for head != nil {
 		if !onEach(head.key, head.value) {
 			break
 		}
@@ -71,19 +71,23 @@ func (c *LRUCache[K, V]) Compact(onEvict func(K, V) bool) {
 func (c *LRUCache[K, V]) Evict(key K, preEvict func(V) bool) bool {
 	c.lock.Lock()
 	defer c.lock.Unlock()
-	value := c.cache[key]
+	node, ok := c.cache[key]
 
-	if !preEvict(value.value) {
+	if !ok {
+		return false
+	}
+
+	if !preEvict(node.value) {
 		return false
 	}
 
 	delete(c.cache, key)
 
-	value.prev.next = value.next
-	value.next.prev = value.prev
+	node.prev.next = node.next
+	node.next.prev = node.prev
 
-	if c.listHead == value {
-		c.listHead = value.next
+	if c.listHead == node {
+		c.listHead = node.next
 	}
 
 	if c.length == 1 {
@@ -126,8 +130,9 @@ func (c *LRUCache[K, V]) Get(key K) (V, bool) {
 	defer c.lock.RUnlock()
 	value, ok := c.cache[key]
 
+	var def V
 	if !ok {
-		return value.value, false
+		return def, false
 	}
 
 	value.prev.next = value.next

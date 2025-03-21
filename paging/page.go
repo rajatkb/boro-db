@@ -86,11 +86,18 @@ func (pfb *Page) SetPageBuffer(offset int, buffer []byte, currentLSN uint32) err
 	pfb.mutex.Lock()
 	defer pfb.mutex.Unlock()
 
-	if offset > len(pfb.buffer)-pageBufferBlockByteOffset || len(buffer) > len(pfb.buffer)-pageBufferBlockByteOffset {
+	dataRegion := pfb.buffer
+	if pfb.pageMetaEnabled {
+		if offset > len(pfb.buffer)-pageBufferBlockByteOffset || len(buffer) > len(pfb.buffer)-pageBufferBlockByteOffset {
+			return ErrOutOfBounds
+		}
+		dataRegion = pfb.buffer[pageBufferBlockByteOffset+offset : pageBufferBlockByteOffset+offset+len(buffer)]
+	}
+
+	if offset > len(pfb.buffer) || len(buffer) > len(pfb.buffer) {
 		return ErrOutOfBounds
 	}
 
-	dataRegion := pfb.buffer[pageBufferBlockByteOffset+offset : pageBufferBlockByteOffset+offset+len(buffer)]
 	copy(dataRegion, buffer)
 	pfb.currentLSN = currentLSN
 	pfb.dirty = true

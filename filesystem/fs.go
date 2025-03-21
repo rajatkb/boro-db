@@ -28,12 +28,14 @@ type FileSystem interface {
 
 	// Mark the pages free for future usage
 	Free(pages []uint64) error
+
+	Flush() error
 }
 
 type FileSystemOptions struct {
 	heap.HeapFileOptions
 	paging.PageSystemOption
-	ExtendAddressSpaceBy int
+	ExtendAddressSpaceByPageCount int
 }
 
 type localfilesystem struct {
@@ -41,6 +43,10 @@ type localfilesystem struct {
 	heap    heap.HeapFile
 	paging  paging.PageSystem
 	logger  log.Logger
+}
+
+func (lfs *localfilesystem) Flush() error {
+	return lfs.paging.Flush()
 }
 
 /*
@@ -88,12 +94,11 @@ func (lfs *localfilesystem) Malloc(count uint64) ([]uint64, error) {
 
 	pages, err := lfs.heap.Malloc(count)
 	if err != nil {
-		lfs.logger.Error().Err(err).Msg("error allocating pages")
-		return nil, err
+		lfs.logger.Debug().Msg("error allocating pages , not enough space extending space")
 	}
 
 	if len(pages) != int(count) {
-		lfs.heap.ExtendBy(int(lfs.options.ExtendAddressSpaceBy))
+		lfs.heap.ExtendBy(int(lfs.options.ExtendAddressSpaceByPageCount))
 		pg, err := lfs.heap.Malloc(count - uint64(len(pages)))
 		if err != nil {
 			lfs.logger.Error().Err(err).Msg("error allocating pages")

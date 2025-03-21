@@ -2,16 +2,18 @@ package freelist
 
 import (
 	"errors"
+	"fmt"
 )
 
 type FreeList interface {
 	// Attempt allocating number of pages requested
-	GetPages(count uint64) ([]uint64, error)
+	GetLocs(count uint64) ([]uint64, error)
 	// Release pages back to the free list
-	ReleasePages(pages []uint64) error
-	FreePagesAvailable() uint64 // Returns the number of free pages available
-	CurrentAddressRange() [2]uint64
-	IsPageFree(page uint64) bool
+	ReleaseLoc(pages []uint64) error
+	TotalFreeLocs() uint64 // Returns the number of free pages available
+	LocsRange() [2]uint64
+	IsLocFree(page uint64) bool
+	CurrentBuffer() []byte
 }
 
 type BitmapFreeList struct {
@@ -23,20 +25,24 @@ type BitmapFreeList struct {
 	freePages uint64 // Counter for free pages available
 }
 
-func (fl *BitmapFreeList) IsPageFree(page uint64) bool {
+func (fl *BitmapFreeList) CurrentBuffer() []byte {
+	return fl.bitmap
+}
+
+func (fl *BitmapFreeList) IsLocFree(page uint64) bool {
 	if page < fl.start || page >= fl.end {
 		return false
 	}
 	return fl.bitmap[page/8]&(1<<(page%8)) == 0
 }
 
-func (fl *BitmapFreeList) FreePagesAvailable() uint64 {
+func (fl *BitmapFreeList) TotalFreeLocs() uint64 {
 	return fl.freePages
 }
 
-func (fl *BitmapFreeList) GetPages(count uint64) ([]uint64, error) {
+func (fl *BitmapFreeList) GetLocs(count uint64) ([]uint64, error) {
 	if count == 0 {
-		return nil, nil
+		return nil, fmt.Errorf("no free pages available")
 	}
 
 	var pages []uint64
@@ -59,7 +65,7 @@ func (fl *BitmapFreeList) GetPages(count uint64) ([]uint64, error) {
 	return pages, nil
 }
 
-func (fl *BitmapFreeList) ReleasePages(pages []uint64) error {
+func (fl *BitmapFreeList) ReleaseLoc(pages []uint64) error {
 	if len(pages) == 0 {
 		return nil
 	}
@@ -84,7 +90,7 @@ func (fl *BitmapFreeList) ReleasePages(pages []uint64) error {
 	return nil
 }
 
-func (fl *BitmapFreeList) CurrentAddressRange() [2]uint64 {
+func (fl *BitmapFreeList) LocsRange() [2]uint64 {
 	return [2]uint64{fl.start, fl.end}
 }
 

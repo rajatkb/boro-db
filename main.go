@@ -11,10 +11,10 @@ func main() {
 	logger := logging.CreateDebugLogger()
 
 	heapFileOptions := heap.HeapFileOptions{
-		PageSizeByte:     4096,
-		FileDirectory:    "./test",
-		HeapFileSizeByte: 1024 * 1024 * 1024, // 1GB
-		RequireFreeList:  true,
+		PageSizeByte:        4096,
+		FileDirectory:       "./test",
+		MaxHeapFileSizeByte: 1024 * 1024 * 1024, // 1GB
+		RequireFreeList:     true,
 	}
 	fs, err := filesystem.NewFileSystem(*logger, &filesystem.FileSystemOptions{
 		HeapFileOptions: heapFileOptions,
@@ -26,6 +26,7 @@ func main() {
 			BufferPoolFlushIntervalms:    1000,
 			EnablePageMeta:               false,
 		},
+		ExtendAddressSpaceByPageCount: int(heapFileOptions.MaxHeapFileSizeByte) / int(heapFileOptions.PageSizeByte),
 	})
 
 	if err != nil {
@@ -33,7 +34,12 @@ func main() {
 		return
 	}
 
-	pages, err := fs.Malloc(1024)
+	pages, err := fs.Malloc(1)
+
+	if err != nil {
+		logger.Error().Err(err).Msg("failed to malloc pages")
+		return
+	}
 
 	fs.Write(pages[0], func(p *paging.Page, err error) {
 		p.SetPageBuffer(0, []byte("hello world"), 0)
@@ -44,4 +50,6 @@ func main() {
 			logger.Info().Msg(string(b))
 		})
 	})
+
+	fs.Flush()
 }
